@@ -1,0 +1,3 @@
+add_executable(FlashAttentionV2 main.cu)
+
+target_link_libraries(FlashAttentionV2 PRIVATE FlashAttentionUtility)
