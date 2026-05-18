@@ -19,11 +19,6 @@ namespace FlashAttention::utility {
 
     bool check_equal(torch::Tensor t1, torch::Tensor t2, float tol, int print_count) {
         using at::indexing::Slice;
-        if (torch::isnan(t1).any().item<bool>() || torch::isnan(t2).any().item<bool>()) {
-            std::cout << "Error: NaN detected in tensors!" << std::endl;
-            return false;
-        }
-        
         std::cout << "First " << print_count << ":\n";
         std::cout << "t1: ";
         for (int i = 0; i < print_count; i++) {
@@ -33,7 +28,10 @@ namespace FlashAttention::utility {
         for (int i = 0; i < print_count; i++) {
             std::cout << t2[0][0][0][i].item<float>() << " \n"[i == print_count - 1];
         }
-
+        if (torch::isnan(t1).any().item<bool>() || torch::isnan(t2).any().item<bool>()) {
+            std::cout << "Error: NaN detected in tensors!" << std::endl;
+            return false;
+        }
         torch::Tensor mask = torch::abs(t1 - t2) > tol;
         if (!mask.any().item<bool>()) {
             std::cout << "All close!" << std::endl;

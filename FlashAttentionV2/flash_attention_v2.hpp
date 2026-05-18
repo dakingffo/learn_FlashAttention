@@ -15,16 +15,17 @@ namespace FlashAttention::V2 {
     using namespace cutlass;
 
     template <
-        size_t   QPerCTA  = 128,
-        size_t   TileHead = 64,
-        size_t   EUReapt  = 8,
         size_t   Pipe     = 5,
+        size_t   QPerCTA  = 64,
+        size_t   TileHead = 64,
+        size_t   EUReapt  = 4,
         typename MMAOP    = SM80_16x8x16_F32F16F16F32_TN
     >
     struct Traits {
         static constexpr int TileQ   = QPerCTA;
         static constexpr int TileKV  = TileHead;
         static constexpr int Stage   = Pipe;
+        static_assert(Stage >= 2);
 
         using mma_op         = MMAOP;
         using mma_traits     = MMA_Traits<mma_op>;
@@ -52,8 +53,9 @@ namespace FlashAttention::V2 {
             Tile<Int<PM>, Int<PN>, Int<PK>>{}
         ));
 
-        static constexpr int NumThreads = thr_size(MMA{});
-        using CopyThreadsLayout = decltype(make_layout(Shape<Int<NumThreads / 4>, _4>{}, Stride<_4, _1>{}));
+        static constexpr int ThreadsPerCTA = thr_size(MMA{});
+
+        using CopyThreadsLayout = decltype(make_layout(Shape<Int<ThreadsPerCTA / 4>, _4>{}, Stride<_4, _1>{}));
 
         using g2s_copy_op     = SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>;
         using g2s_copy_traits = Copy_Traits<g2s_copy_op>;
@@ -98,8 +100,56 @@ namespace FlashAttention::V2 {
         ));
     };
 
-    template <typename Traits, int HeadDim>
-    __global__ __launch_bounds__(Traits::NumThreads)
+    template <
+        size_t Dim, size_t CTATile, bool FillOutOfBoundary = true,
+        typename TiledCopy, typename Identity,
+        typename SrcTensor, typename DstTensor
+    >
+    CUTE_DEVICE void copy_within_boundary(
+        TiledCopy&& tiled_copy, 
+        signed long len, unsigned int idx, 
+        const Identity& identity,
+        const SrcTensor& src, DstTensor&& dst,
+        typename std::decay_t<DstTensor>::value_type val = typename std::decay_t<DstTensor>::value_type{0.0}
+    ) {
+        if ((idx + 1) * CTATile - 1 < len) {
+            copy(tiled_copy, src, dst);
+        }
+        else {
+            auto mask = make_tensor<bool>(shape(identity));
+            CUTE_UNROLL
+            for (int i = 0; i < size(identity); i++) {
+                bool within_boundary = (idx * CTATile + get<Dim>(identity(i)) < len);
+                mask(i) = within_boundary;
+                if constexpr (FillOutOfBoundary) {
+                    dst(i) = (within_boundary ? dst(i) : val);
+                }
+            }
+            copy_if(tiled_copy, mask, src, dst);
+        }
+    }
+
+    template <size_t Dim, size_t CTATile, typename Tensor, typename Identity>
+    CUTE_DEVICE void fill_cross_boundary(
+        Tensor&& tensor, 
+        signed long len, unsigned int idx,
+        const Identity& identity,
+        typename decay_t<Tensor>::value_type internal,
+        typename decay_t<Tensor>::value_type external
+    ) {
+        if ((idx + 1) * CTATile - 1 < len) {
+            fill(tensor, internal);
+        }
+        else {
+            CUTE_UNROLL
+            for (int i = 0; i < size(identity); i++) {
+                tensor(i) = (idx * CTATile + get<Dim>(identity(i)) < len ? internal : external);
+            }
+        }
+    }
+
+    template <typename Traits, size_t HeadDim>
+    __global__ __launch_bounds__(Traits::ThreadsPerCTA)
     void forward_kernel(
         utility::Parameters<HeadDim>   params,
         typename Traits::const_pointer q,
@@ -119,51 +169,38 @@ namespace FlashAttention::V2 {
         using S2GCopy   = typename Traits::S2GCopy;
         using CLayout   = typename Traits::mma_traits::CLayout;
 
-        static constexpr int TileQ  = Traits::TileQ;
-        static constexpr int TileKV = Traits::TileKV;
-        static constexpr int Stage  = Traits::Stage;
-        static constexpr int ThreadPerRow = size<0, 0>(CLayout{});
-        static constexpr int RowPerThread = size<1, 1>(CLayout{}) * TileQ / Traits::PM;
-        static constexpr int SwizzleBits  = 3;
-        static constexpr int SwizzleBase  = utility::log2<16 / sizeof(type)>();
-        static constexpr int SwizzleShift = 3;
-        static constexpr int BlockKSmem   = HeadDim % 64 == 0 ? 64 : 32;
-        static constexpr int SqrtD        = utility::sqrt<HeadDim>();
-        
+        static constexpr int   TileQ         = Traits::TileQ;
+        static constexpr int   TileKV        = Traits::TileKV;
+        static constexpr int   Stage         = Traits::Stage;
+        static constexpr int   ThreadsPerRow = size<0, 0>(CLayout{});
+        static constexpr int   RowsPerThread = size<1, 1>(CLayout{}) * TileQ / Traits::PM;
+        static constexpr int   SwizzleBits   = 3;
+        static constexpr int   SwizzleBase   = utility::log2<16 / sizeof(type)>();
+        static constexpr int   SwizzleShift  = 3;
+        static constexpr int   BlockKSmem    = HeadDim % 64 == 0 ? 64 : 32;
+        static constexpr float SqrtD         = utility::sqrt<HeadDim>();
+
         auto SmemLayoutAtom   = make_layout(Shape<_8, Int<BlockKSmem>>{}, Stride<Int<BlockKSmem>, _1>{});
-        auto SmemLayoutVTAtom = make_layout(Shape<Int<BlockKSmem>, _8>{}, Stride<_1, Int<BlockKSmem>>{});
-        auto SmemSwizzleAtom = composition(
-            Swizzle<SwizzleBits, SwizzleBase, SwizzleShift>{}, 
-            SmemLayoutAtom
-        );
-        auto SmemSwizzleVTAtom = composition(
-            Swizzle<SwizzleBits, SwizzleBase, SwizzleShift>{}, 
-            SmemLayoutVTAtom
-        );
-        auto SmemLayoutQ = tile_to_shape(
-            SmemSwizzleAtom,
+        auto SmemLayoutQLogical = tile_to_shape(
+            SmemLayoutAtom,
             make_shape(Int<TileQ>{}, Int<HeadDim>{})
         );
-        auto SmemLayoutK = tile_to_shape(
-            SmemSwizzleAtom,
-            make_shape(Int<TileKV>{}, Int<HeadDim>{}, Int<Stage>{})
-        ); 
-        auto SmemLayoutV = tile_to_shape(
-            SmemSwizzleAtom,
+        auto SmemLayoutKLogical = tile_to_shape(
+            SmemLayoutAtom,
             make_shape(Int<TileKV>{}, Int<HeadDim>{}, Int<Stage>{})
         );
-        auto SmemLayoutO = tile_to_shape(
-            SmemSwizzleAtom,
-            make_shape(Int<TileQ>{}, Int<HeadDim>{})
+        auto SmemLayoutVLogical = tile_to_shape(
+            SmemLayoutAtom,
+            make_shape(Int<TileKV>{}, Int<HeadDim>{}, Int<Stage>{})
         );
-        auto SmemLayoutVT = tile_to_shape(
-            SmemSwizzleVTAtom,
-            make_shape(Int<HeadDim>{}, Int<TileKV>{}, Int<Stage>{})
-        );
-        auto SmemLayoutVTNoSwizzle = tile_to_shape(
-            SmemLayoutVTAtom,
-            make_shape(Int<HeadDim>{}, Int<TileKV>{}, Int<Stage>{})
-        );
+        auto SmemLayoutVTLogical   = select<1, 0, 2>(SmemLayoutVLogical);
+        auto SwizzleFn             = Swizzle<SwizzleBits, SwizzleBase, SwizzleShift>{};
+        auto SmemLayoutQ           = composition(SwizzleFn, SmemLayoutQLogical);
+        auto SmemLayoutK           = composition(SwizzleFn, SmemLayoutKLogical);
+        auto SmemLayoutV           = composition(SwizzleFn, SmemLayoutVLogical);
+        auto SmemLayoutO           = composition(SwizzleFn, SmemLayoutQLogical);
+        auto SmemLayoutVT          = composition(SwizzleFn, SmemLayoutVTLogical);
+        auto SmemLayoutVTNoSwizzle = SmemLayoutVTLogical;
 
         extern __shared__ char shared_mem[];
 
@@ -178,10 +215,8 @@ namespace FlashAttention::V2 {
         Tensor sVtNoSwizzle = make_tensor(sV.data(), SmemLayoutVTNoSwizzle); 
         // (HeadDim, TileKV, Stage)
 
-        auto mx  = make_tensor<acc_type>(Shape<Int<RowPerThread>, _2>{}); // (RowPerThread, 2) for old_max, new_max
-        fill(mx, numeric_limits<acc_type>::lowest());
-        auto den = make_tensor<acc_type>(Shape<Int<RowPerThread>>{});     // (RowPerThread)  
-        clear(den);
+        auto mx  = make_tensor<acc_type>(Shape<Int<RowsPerThread>, _2>{}); // (RowsPerThread, 2) for old_max, new_max
+        auto den = make_tensor<acc_type>(Shape<Int<RowsPerThread>>{});     // (RowsPerThread)  
 
         Layout GlobalLayout = make_layout(
             make_shape(params.batch_size, params.num_heads, params.seq_len, Int<HeadDim>{}),
@@ -205,14 +240,21 @@ namespace FlashAttention::V2 {
         Tensor gV = local_tile(V, Tile<Int<TileKV>, Int<HeadDim>>{}, make_coord(_, 0));         // (TileV, HeadDim, num_tiles_v)
         Tensor gO = local_tile(O, Tile<Int<TileQ>, Int<HeadDim>>{}, make_coord(blockIdx.z, 0)); // (TileQ, HeadDim)
 
+        auto iQ = make_identity_tensor(shape(gQ));
+        auto iK = make_identity_tensor(shape(gK(_, _, 0)));
+        auto iV = make_identity_tensor(shape(gV(_, _, 0)));
+        auto iS = make_identity_tensor(Shape<Int<TileQ>, Int<TileKV>>{});
+        auto iO = make_identity_tensor(shape(gO));
+
         MMA tiled_mma;
         ThrMMA thr_mma = tiled_mma.get_slice(threadIdx.x);
         Tensor tSrQ = thr_mma.partition_fragment_A(gQ);                                  // (MMA, MMA_TileQ, MMA_HeadDim)
         Tensor tSrK = thr_mma.partition_fragment_B(gK(_, _, 0));                         // (MMA, MMA_TileK, MMA_HeadDim)
         Tensor tSrS = partition_fragment_C(tiled_mma, Shape<Int<TileQ>, Int<TileKV>>{}); // (MMA, MMA_TileQ, MMA_TileK)
-        // clear in for loop
+        // tSrS clear in loop
 
-        auto tOrP  = make_tensor_like<type>(tSrQ);                          // (MMA, MMA_TileQ, MMA_TileK)
+        auto tOrP  = thr_mma.partition_fragment_A(make_tensor<type>(Shape<Int<TileQ>, Int<TileKV>>{}));   
+                                                                            // (MMA, MMA_TileQ, MMA_TileK)
         Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle(_, _, 0)); // (MMA, MMA_HeadDim, MMA_TileV)
         Tensor tOrO  = thr_mma.partition_fragment_C(gO);                    // (MMA, MMA_TileQ, MMA_HeadDim)
         clear(tOrO);
@@ -263,20 +305,38 @@ namespace FlashAttention::V2 {
 
         int global_read = 0, smem_pipe_read = 0, smem_pipe_write = 0;
 
-        copy(g2s_copy_q, tSgQ_g2s_view, tSsQ_g2s_view);
+        // copy(g2s_copy_q, tSgQ_g2s_view, tSsQ_g2s_view);
+        copy_within_boundary<0, TileQ>(
+            g2s_copy_q, params.seq_len, blockIdx.z, 
+            thr_g2s_copy_q.partition_S(iQ),
+            tSgQ_g2s_view, tSsQ_g2s_view
+        );
         cp_async_fence();
         CUTE_UNROLL
-        for (; smem_pipe_write < Stage - 1; global_read++, smem_pipe_write++) {
-            copy(g2s_copy_k, tSgK_g2s_view(_, _, _, global_read), tSsK_g2s_view(_, _, _, smem_pipe_write));
-            copy(g2s_copy_v, tOgV_g2s_view(_, _, _, global_read), tOsV_g2s_view(_, _, _, smem_pipe_write));
+        for (; smem_pipe_write < min(Stage - 1, ceil_div(params.seq_len, TileKV)); global_read++, smem_pipe_write++) {
+            copy_within_boundary<0, TileKV>(
+                g2s_copy_k, params.seq_len, global_read, 
+                thr_g2s_copy_k.partition_S(iK),
+                tSgK_g2s_view(_, _, _, global_read), tSsK_g2s_view(_, _, _, smem_pipe_write)
+            );
+            copy_within_boundary<0, TileKV>(
+                g2s_copy_v, params.seq_len, global_read, 
+                thr_g2s_copy_v.partition_S(iV),
+                tOgV_g2s_view(_, _, _, global_read), tOsV_g2s_view(_, _, _, smem_pipe_write)
+            );
             cp_async_fence();
         }
         cp_async_wait<Stage - 2>(); // Q is ready
         __syncthreads();
 
         CUTE_UNROLL
-        for (int kv_idx = 0, mx_idx = 0; kv_idx < params.seq_len / TileKV; kv_idx++, mx_idx ^= 1) {
-            clear(tSrS);
+        for (int kv_idx = 0, mx_idx = 0; kv_idx < ceil_div(params.seq_len, TileKV); kv_idx++, mx_idx ^= 1) {
+            // clear(tSrS);
+            fill_cross_boundary<1, TileKV>(
+                tSrS, params.seq_len, kv_idx, 
+                thr_mma.partition_fragment_C(iS),
+                acc_type{0.0}, numeric_limits<acc_type>::lowest()
+            );
             // Q * K -> S
             if (kv_idx == 0) {
                 copy(s2r_copy_q, tSsQ_s2r_view(_, _, 0), tSrQ_s2r_view(_, _, 0));
@@ -285,9 +345,17 @@ namespace FlashAttention::V2 {
             CUTE_UNROLL
             for (int i = 0; i < size<2>(tSrQ); i++) {
                 if (i == 0) {
-                    if (global_read < params.seq_len / TileKV) {
-                        copy(g2s_copy_k, tSgK_g2s_view(_, _, _, global_read), tSsK_g2s_view(_, _, _, smem_pipe_write));
-                        copy(g2s_copy_v, tOgV_g2s_view(_, _, _, global_read), tOsV_g2s_view(_, _, _, smem_pipe_write));
+                    if (global_read < ceil_div(params.seq_len, TileKV)) {
+                        copy_within_boundary<0, TileKV>(
+                            g2s_copy_k, params.seq_len, global_read, 
+                            thr_g2s_copy_k.partition_S(iK),
+                            tSgK_g2s_view(_, _, _, global_read), tSsK_g2s_view(_, _, _, smem_pipe_write)
+                        );
+                        copy_within_boundary<0, TileKV>(
+                            g2s_copy_v, params.seq_len, global_read, 
+                            thr_g2s_copy_v.partition_S(iV),
+                            tOgV_g2s_view(_, _, _, global_read), tOsV_g2s_view(_, _, _, smem_pipe_write)
+                        );
                         global_read++;
                         smem_pipe_write = (smem_pipe_write + 1) % Stage;
                     }
@@ -300,11 +368,11 @@ namespace FlashAttention::V2 {
                 gemm(tiled_mma, tSrS, tSrQ(_, _, i), tSrK(_, _, i), tSrS);
             }
             
-            // SoftMax on S -> P
+            // Online SoftMax(S) -> P
             CUTE_UNROLL
             for (int i = 0; i < size<0>(mx); i++) {
                 int a = i % size<0, 1>(tSrS), b = i / size<0, 1>(tSrS);
-                acc_type new_max = mx(i, mx_idx);
+                acc_type new_max = (kv_idx != 0 ? mx(i, mx_idx) : numeric_limits<acc_type>::lowest());
                 CUTE_UNROLL
                 for (int k = 0; k < size<2>(tSrS); k++)  {
                     CUTE_UNROLL
@@ -313,7 +381,7 @@ namespace FlashAttention::V2 {
                     }
                 }
                 CUTE_UNROLL
-                for (int offset = ThreadPerRow >> 1; offset; offset >>= 1) {
+                for (int offset = ThreadsPerRow >> 1; offset; offset >>= 1) {
                     new_max = max(new_max, __shfl_xor_sync(0xffffffff, new_max, offset));
                 }
                 mx(i, mx_idx ^ 1) = new_max;
@@ -328,10 +396,10 @@ namespace FlashAttention::V2 {
                     }
                 );
                 CUTE_UNROLL
-                for (int offset = ThreadPerRow >> 1; offset; offset >>= 1) {
+                for (int offset = ThreadsPerRow >> 1; offset; offset >>= 1) {
                     delta_den += __shfl_xor_sync(0xffffffff, delta_den, offset);
                 }
-                if (kv_idx) {
+                if (kv_idx != 0) {
                     acc_type rescale = expf((mx(i, mx_idx) - new_max) / SqrtD);
                     cute::transform(
                         tOrO(make_coord(_, a), b, _),
@@ -339,9 +407,11 @@ namespace FlashAttention::V2 {
                             return ele * rescale;
                         }
                     );
-                    den(i) *= rescale;
+                    den(i) = den(i) * rescale + delta_den;
                 }
-                den(i) += delta_den;
+                else {
+                    den(i) = delta_den;
+                }
             }
             
             // P * V -> O
@@ -370,7 +440,7 @@ namespace FlashAttention::V2 {
             );
         }
 
-        Tensor rO = make_tensor(tOrP.data(), tOrO.layout());                      // acc_type -> type
+        Tensor rO = make_tensor(tSrQ.data(), tOrO.layout());                      // acc_type -> type
         Tensor sO = make_tensor(make_smem_ptr((pointer)shared_mem), SmemLayoutO); // (TileQ, HeadDim)
         copy(tOrO, rO);
         R2SCopyC r2s_copy_o;
@@ -384,17 +454,20 @@ namespace FlashAttention::V2 {
         Tensor sO_s2g_view = thr_s2g_copy_o.partition_S(sO); // (COPY, COPY_TileQ, COPY_HeadDim)
         Tensor gO_s2g_view = thr_s2g_copy_o.partition_D(gO); // (COPY, COPY_TileQ, COPY_HeadDim)
         __syncthreads();
-        copy(s2g_copy_o, sO_s2g_view, gO_s2g_view);
+        copy_within_boundary<0, TileQ, false>(
+            s2g_copy_o, params.seq_len, blockIdx.z, 
+            thr_s2g_copy_o.partition_D(iO),
+            sO_s2g_view, gO_s2g_view
+        );
     }
 
-    template <size_t HeadDim>
+    template <typename Traits = V2::Traits<>, size_t HeadDim>
     torch::Tensor forward_launch(
         utility::Parameters<HeadDim> params, 
         torch::Tensor q, 
         torch::Tensor k, 
         torch::Tensor v
     ) {
-        using Traits = V2::Traits<>;
         static constexpr int TileQ  = Traits::TileQ;
         static constexpr int TileKV = Traits::TileKV;
         static constexpr int Stage  = Traits::Stage;
@@ -403,8 +476,8 @@ namespace FlashAttention::V2 {
         torch::Tensor out = torch::empty({params.batch_size, params.num_heads, params.seq_len, params.head_dim}, options);
 
         dim3 grid(params.batch_size, params.num_heads, cute::ceil_div(params.seq_len, TileQ));
-        dim3 block(cute::size(Traits::MMA{}));
-        size_t shared_mem_size = (TileQ * params.head_dim + 2 * TileKV * params.head_dim * Stage) * sizeof(Traits::type);
+        dim3 block(Traits::ThreadsPerCTA);
+        size_t shared_mem_size = (TileQ * params.head_dim + 2 * TileKV * params.head_dim * Stage) * sizeof(typename Traits::type);
 
         CUTE_CHECK_ERROR(cudaFuncSetAttribute(
             forward_kernel<Traits, HeadDim>, 
@@ -413,10 +486,10 @@ namespace FlashAttention::V2 {
         ));
         forward_kernel<Traits, HeadDim><<<grid, block, shared_mem_size>>>(
             params,
-            (Traits::const_pointer)q.data_ptr<Traits::torch_type>(),
-            (Traits::const_pointer)k.data_ptr<Traits::torch_type>(),
-            (Traits::const_pointer)v.data_ptr<Traits::torch_type>(),
-            (Traits::pointer)out.data_ptr<Traits::torch_type>()
+            (typename Traits::const_pointer)q.data_ptr<typename Traits::torch_type>(),
+            (typename Traits::const_pointer)k.data_ptr<typename Traits::torch_type>(),
+            (typename Traits::const_pointer)v.data_ptr<typename Traits::torch_type>(),
+            (typename Traits::pointer)out.data_ptr<typename Traits::torch_type>()
         );
         CUTE_CHECK_ERROR(cudaDeviceSynchronize());
 
