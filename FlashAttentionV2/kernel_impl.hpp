@@ -142,6 +142,12 @@ namespace FlashAttention::V2 {
         Tensor V = make_tensor(make_gmem_ptr(v), GlobalLayout)(blockIdx.x, blockIdx.y, _, _);   // (seq_len, HeadDim)
         Tensor O = make_tensor(make_gmem_ptr(out), GlobalLayout)(blockIdx.x, blockIdx.y, _, _); // (seq_len, HeadDim)
 
+        Layout GmemLayoutLSE = make_layout(
+            make_shape(params.batch_size, params.num_heads, params.seq_len),
+            make_stride(params.num_heads * params.seq_len, params.seq_len, _1{})
+        );
+        Tensor LSE = make_tensor(make_gmem_ptr(lse), GmemLayoutLSE)(blockIdx.x, blockIdx.y, _);
+        
         /*
             For batch = blockIdx.x and head = blockIdx.y:
             Each cta will compute a TileQ x head_dim tile of Q, then loop over seq_len / TileKV tiles of K and V
@@ -376,11 +382,6 @@ namespace FlashAttention::V2 {
             sO_s2g_view, gO_s2g_view
         );
 
-        auto LSELayout = make_layout(
-            make_shape(params.batch_size, params.num_heads, params.seq_len),
-            make_stride(params.num_heads * params.seq_len, params.seq_len, _1{})
-        );
-        Tensor LSE  = make_tensor(make_gmem_ptr(lse), LSELayout)(blockIdx.x, blockIdx.y, _);
         Tensor gLSE = local_tile(LSE, Tile<Int<TileQ>>{}, make_coord(blockIdx.z));
         if (threadIdx.x % ThreadsPerRow == 0) {
             for (int i = 0; i < RowsPerThread; i++) {
