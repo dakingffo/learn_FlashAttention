@@ -2,12 +2,12 @@
 #include <cute/tensor.hpp>
 
 namespace FlashAttention::utility {
-    template <size_t HeadDim = 64>
-    struct Parameters {
-        signed long batch_size;
-        signed long num_heads;
-        signed long seq_len;
-        static constexpr signed long head_dim = HeadDim;
+    struct Params {
+        int   batch_size;
+        int   num_heads;
+        int   seq_len;
+        int   head_dim;
+        float scale = 0;
 
         CUTE_HOST_DEVICE signed long one_head_size() const noexcept {
             return seq_len * head_dim;
