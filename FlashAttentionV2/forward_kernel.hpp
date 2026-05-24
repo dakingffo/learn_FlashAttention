@@ -3,7 +3,6 @@
 #include <cute/algorithm/tensor_reduce.hpp>
 #include <cutlass/numeric_conversion.h>
 
-#include <utility/math.hpp>
 #include <utility/params.hpp>
 
 namespace FlashAttention::V2 {
@@ -55,7 +54,7 @@ namespace FlashAttention::V2 {
         }
     }
 
-    template <typename Traits, size_t HeadDim>
+    template <typename Traits>
     __global__ __launch_bounds__(Traits::ThreadsPerCTA)
     void forward_kernel(
         __grid_constant__ const utility::Params params,
@@ -76,46 +75,25 @@ namespace FlashAttention::V2 {
         using S2RCopyBT = typename Traits::S2RCopyBT;
         using R2SCopyC  = typename Traits::R2SCopyC;
         using S2GCopy   = typename Traits::S2GCopy;
-        using CLayout   = typename Traits::mma_traits::CLayout;
 
+        static constexpr int HeadDim        = Traits::HeadDim;
         static constexpr int TileQ          = Traits::TileQ;
         static constexpr int TileKV         = Traits::TileKV;
         static constexpr int Stage          = Traits::Stage;
         static constexpr int AtomM          = Traits::AtomM;
         static constexpr int PM             = Traits::PM;
-        static constexpr int ThreadsPerRow  = size<0, 0>(CLayout{});
-        static constexpr int RowsPerThread  = size<1, 1>(CLayout{}) * TileQ / Traits::PM;
-        static constexpr int ThreadsPerCol  = size<0, 1>(CLayout{});
-        static constexpr int ThreadsPerAtom = ThreadsPerRow * ThreadsPerCol;
-        static constexpr int SwizzleBits    = 3;
-        static constexpr int SwizzleBase    = utility::log2<16 / sizeof(type)>();
-        static constexpr int SwizzleShift   = 3;
-        static constexpr int BlockKSmem     = HeadDim % 64 == 0 ? 64 : 32;
+        static constexpr int ThreadsPerRow  = Traits::ThreadsPerRow;
+        static constexpr int RowsPerThread  = Traits::RowsPerThread;
+        static constexpr int ThreadsPerCol  = Traits::ThreadsPerCol;
+        static constexpr int ThreadsPerAtom = Traits::ThreadsPerAtom;
 
-        using SmemLayoutAtom     = decltype(
-            make_layout(Shape<_8, Int<BlockKSmem>>{}, Stride<Int<BlockKSmem>, _1>{})
-        );
-        using SmemLayoutQLogical = decltype(tile_to_shape(
-            SmemLayoutAtom{},
-            make_shape(Int<TileQ>{}, Int<HeadDim>{})
-        ));
-        using SmemLayoutKLogical = decltype(tile_to_shape(
-            SmemLayoutAtom{},
-            make_shape(Int<TileKV>{}, Int<HeadDim>{}, Int<Stage>{})
-        ));
-        using SmemLayoutVLogical = decltype(tile_to_shape(
-            SmemLayoutAtom{},
-            make_shape(Int<TileKV>{}, Int<HeadDim>{}, Int<Stage>{})
-        ));
-        using SmemLayoutVTLogical   = decltype(select<1, 0, 2>(SmemLayoutVLogical{}));
-        using SwizzleFn             = Swizzle<SwizzleBits, SwizzleBase, SwizzleShift>;
-        using SmemLayoutQ           = decltype(composition(SwizzleFn{}, SmemLayoutQLogical{}));
-        using SmemLayoutK           = decltype(composition(SwizzleFn{}, SmemLayoutKLogical{}));
-        using SmemLayoutV           = decltype(composition(SwizzleFn{}, SmemLayoutVLogical{}));
-        using SmemLayoutO           = SmemLayoutQ;
-        using SmemLayoutVT          = decltype(composition(SwizzleFn{}, SmemLayoutVTLogical{}));
-        using SmemLayoutVNoSwizzle  = SmemLayoutVLogical;
-        using SmemLayoutVTNoSwizzle = SmemLayoutVTLogical;
+        using SmemLayoutQ           = typename Traits::SmemLayoutNoPipe;
+        using SmemLayoutK           = typename Traits::SmemLayout;
+        using SmemLayoutV           = typename Traits::SmemLayout;
+        using SmemLayoutO           = typename Traits::SmemLayoutNoPipe;
+        using SmemLayoutVT          = typename Traits::SmemLayoutT;
+        using SmemLayoutVNoSwizzle  = typename Traits::SmemLayoutLogical;
+        using SmemLayoutVTNoSwizzle = typename Traits::SmemLayoutTLogical;
         
         extern __shared__ char shared_mem[];
 

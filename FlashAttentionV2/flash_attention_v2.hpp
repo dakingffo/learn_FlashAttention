@@ -1,9 +1,10 @@
+#pragma once
+
 #include <tuple>
 
-#include <utility/dispatch.hpp>
+#include <torch/torch.h>
 
-#include "traits.hpp"
-#include "kernel_impl.hpp"
+#include <utility/params.hpp>
 
 namespace FlashAttention::V2 {
     std::tuple<torch::Tensor, torch::Tensor> forward_launch(
@@ -11,54 +12,39 @@ namespace FlashAttention::V2 {
         torch::Tensor   q, 
         torch::Tensor   k, 
         torch::Tensor   v
-    ) DISPATCH_VALUE(int, HeadDim, params.head_dim,
-      DISPATCH_TYPE(CutlassType, q.scalar_type(), {
-        using Traits = typename DispatchTraits<CutlassType, HeadDim>::type;
-        static constexpr int TileQ  = Traits::TileQ;
-        static constexpr int TileKV = Traits::TileKV;
-        static constexpr int Stage  = Traits::Stage;
-        
-        auto out_options = torch::TensorOptions().dtype(q.dtype()).device(q.device());
-        torch::Tensor out = torch::empty({params.batch_size, params.num_heads, params.seq_len, params.head_dim}, out_options);
-        auto lse_options = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
-        torch::Tensor lse = torch::empty({params.batch_size, params.num_heads, params.seq_len}, lse_options);
+    );
 
-        dim3 grid(params.batch_size, params.num_heads, cute::ceil_div(params.seq_len, TileQ));
-        dim3 block(Traits::ThreadsPerCTA);
-        size_t shared_mem_size = (TileQ * params.head_dim + 2 * TileKV * params.head_dim * Stage) * sizeof(typename Traits::type);
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> backward_launch(
+        utility::Params params, 
+        torch::Tensor   q,
+        torch::Tensor   k,
+        torch::Tensor   v,
+        torch::Tensor   grad_o
+    );
 
-        params.scale = 1 / std::sqrt(HeadDim);
-        CUTE_CHECK_ERROR(cudaFuncSetAttribute(
-            forward_kernel<Traits, HeadDim>, 
-            cudaFuncAttributeMaxDynamicSharedMemorySize, 
-            shared_mem_size
-        ));
-        forward_kernel<Traits, HeadDim><<<grid, block, shared_mem_size>>>(
-            params,
-            (typename Traits::const_pointer)q.data_ptr<typename Traits::torch_type>(),
-            (typename Traits::const_pointer)k.data_ptr<typename Traits::torch_type>(),
-            (typename Traits::const_pointer)v.data_ptr<typename Traits::torch_type>(),
-            (typename Traits::pointer)out.data_ptr<typename Traits::torch_type>(),
-            (typename Traits::lse_pointer)lse.data_ptr<typename Traits::lse_type>()
-        );
-        CUTE_CHECK_ERROR(cudaDeviceSynchronize());
-
-        return std::make_tuple(out, lse);
-    }))
-/*
     class Function : public torch::autograd::Function<V2::Function> {
     public:
         static torch::Tensor forward(
-            torch::autograd::AutogradContext *ctx, 
-            torch::Tensor q, 
-            torch::Tensor k, 
-            torch::Tensor v
+            torch::autograd::AutogradContext* ctx, 
+            torch::Tensor                     q, 
+            torch::Tensor                     k, 
+            torch::Tensor                     v
         ) {
+            TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0));
+            TORCH_CHECK(q.size(1) == k.size(1) && q.size(1) == v.size(1));
+            TORCH_CHECK(q.size(2) == k.size(2) && q.size(2) == v.size(2));
+            TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3));
+            TORCH_CHECK(q.dtype() == k.dtype() && q.dtype() == v.dtype());
+
+            utility::Params params{
+                .batch_size = q.size(0), 
+                .num_heads  = q.size(1), 
+                .seq_len    = q.size(2), 
+                .head_dim   = q.size(3)
+            };
             auto [out, lse] = forward_launch(params, q, k, v);
 
             ctx->save_for_backward({q, k, v, out, lse});
-            ctx->saved_data["batch_size"] = params.batch_size;
-            ctx->saved_data["num_heads"]  = params.num_heads;
 
             return out; 
         }
@@ -67,7 +53,7 @@ namespace FlashAttention::V2 {
             torch::autograd::AutogradContext *ctx, 
             torch::autograd::variable_list grad_outputs
         ) {
-            torch::Tensor grad_out = grad_outputs[0];
+            torch::Tensor grad_o = grad_outputs[0];
 
             auto saved = ctx->get_saved_variables();
             torch::Tensor q   = saved[0];
@@ -76,15 +62,22 @@ namespace FlashAttention::V2 {
             torch::Tensor out = saved[3];
             torch::Tensor lse = saved[4];
 
-            int batch_size = ctx->saved_data["batch_size"].toInt();
-            int num_heads  = ctx->saved_data["num_heads"].toInt();
+            TORCH_CHECK(q.size(0) == grad_o.size(0));
+            TORCH_CHECK(q.size(1) == grad_o.size(1));
+            TORCH_CHECK(q.size(2) == grad_o.size(2));
+            TORCH_CHECK(q.size(3) == grad_o.size(3));
+            TORCH_CHECK(q.dtype() == grad_o.dtype());
 
-            torch::Tensor dq = torch::empty_like(q);
-            torch::Tensor dk = torch::empty_like(k);
-            torch::Tensor dv = torch::empty_like(v);
+            utility::Params params{
+                .batch_size = grad_o.size(0), 
+                .num_heads  = grad_o.size(1), 
+                .seq_len    = grad_o.size(2), 
+                .head_dim   = grad_o.size(3)
+            };
 
-            return {torch::Tensor(), dq, dk, dv}; 
+            auto [grad_q, grad_k, grad_v] = backward_launch(params, q, k, v, grad_o);
+
+            return {torch::Tensor(), grad_q, grad_k, grad_v}; 
         }
     };
-*/
 }

@@ -1,6 +1,7 @@
 #include <cute/tensor.hpp>
 #include <cutlass/numeric_types.h>
 
+#include <utility/math.hpp>
 #include <utility/type_traits.hpp>
 
 namespace FlashAttention::V2 {
@@ -19,13 +20,11 @@ namespace FlashAttention::V2 {
     };
 
     template <
-        size_t   Pipe    = 5,
-        size_t   QPerCTA = 64,
-        size_t   TileSeq = 64,
-        size_t   EUReapt = 4,
-        typename MMAOP   = SM80_16x8x16_F32F16F16F32_TN
+        size_t Dim, size_t Pipe, size_t QPerCTA, size_t TileSeq, size_t EUReapt,
+        typename MMAOP /* = SM80_16x8x16_F32BF16BF16F32_TN */
     >
     struct Traits {
+        static constexpr int HeadDim = Dim;
         static constexpr int TileQ   = QPerCTA;
         static constexpr int TileKV  = TileSeq;
         static constexpr int Stage   = Pipe;
@@ -56,13 +55,18 @@ namespace FlashAttention::V2 {
         static constexpr int PK        = AtomK; // only one warp
         static_assert(TileQ >= PM && TileKV >= PN);
 
-        using MMA = decltype(make_tiled_mma(
+        using CLayout = typename mma_traits::CLayout;
+        using MMA     = decltype(make_tiled_mma(
             mma_op{},
             make_layout(Shape<Int<EURepeatM>, _1, _1>{}),
             Tile<Int<PM>, Int<PN>, Int<PK>>{}
         ));
 
-        static constexpr int ThreadsPerCTA = thr_size(MMA{});
+        static constexpr int ThreadsPerRow  = size<0, 0>(CLayout{});
+        static constexpr int RowsPerThread  = size<1, 1>(CLayout{}) * TileQ / PM;
+        static constexpr int ThreadsPerCol  = size<0, 1>(CLayout{});
+        static constexpr int ThreadsPerAtom = ThreadsPerRow * ThreadsPerCol;
+        static constexpr int ThreadsPerCTA  = thr_size(MMA{});
 
         using CopyThreadsLayout = decltype(make_layout(Shape<Int<ThreadsPerCTA / 4>, _4>{}, Stride<_4, _1>{}));
 
@@ -103,68 +107,97 @@ namespace FlashAttention::V2 {
             CopyThreadsLayout{},
             make_layout(Shape<_1, Int<sizeof(uint128_t) / sizeof(type)>>{})
         ));
+
+        static constexpr int SmemColAtom  = HeadDim % 64 == 0 ? 64 : 32;
+        static constexpr int SwizzleBase  = utility::log2<16 / sizeof(type)>();
+        static constexpr int SwizzleShift = 3;
+        static constexpr int SwizzleBits  = utility::log2<8 * SmemColAtom>() - SwizzleShift - SwizzleBase;
+
+        using SmemLayoutAtom          = decltype(
+            make_layout(Shape<_8, Int<SmemColAtom>>{}, Stride<Int<SmemColAtom>, _1>{})
+        );
+        using SmemLayoutNoPipeLogical = decltype(tile_to_shape(
+            SmemLayoutAtom{},
+            make_shape(Int<TileQ>{}, Int<HeadDim>{})
+        ));
+        using SmemLayoutLogical       = decltype(tile_to_shape(
+            SmemLayoutAtom{},
+            make_shape(Int<TileKV>{}, Int<HeadDim>{}, Int<Stage>{})
+        ));
+        using SmemLayoutTLogical      = decltype(select<1, 0, 2>(SmemLayoutLogical{}));
+
+        using SwizzleFn        = Swizzle<SwizzleBits, SwizzleBase, SwizzleShift>;
+        using SmemLayoutNoPipe = decltype(composition(SwizzleFn{}, SmemLayoutNoPipeLogical{}));
+        using SmemLayout       = decltype(composition(SwizzleFn{}, SmemLayoutLogical{}));
+        using SmemLayoutT      = decltype(composition(SwizzleFn{}, SmemLayoutTLogical{}));
     };
 
-    template <typename T, int HeadDim> 
+    template <typename CutlassType, size_t HeadDim> 
     struct DispatchTraits;
 
     template <>
     struct DispatchTraits<cutlass::half_t, 32> {
-        static constexpr int Pipe    = 5;
-        static constexpr int QPerCTA = 128;
-        static constexpr int TileSeq = 64;
-        static constexpr int EUReapt = 8;
+        static constexpr size_t HeadDim = 32;
+        static constexpr size_t Pipe    = 5;
+        static constexpr size_t QPerCTA = 128;
+        static constexpr size_t TileSeq = 64;
+        static constexpr size_t EUReapt = 8;
         using MMAOP = SM80_16x8x16_F32F16F16F32_TN;
-        using type  = Traits<Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
+        using type  = Traits<HeadDim, Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
     };
 
     template <>
     struct DispatchTraits<cutlass::half_t, 64> {
-        static constexpr int Pipe    = 5;
-        static constexpr int QPerCTA = 64;
-        static constexpr int TileSeq = 64;
-        static constexpr int EUReapt = 4;
+        static constexpr size_t HeadDim = 64;
+        static constexpr size_t Pipe    = 5;
+        static constexpr size_t QPerCTA = 64;
+        static constexpr size_t TileSeq = 64;
+        static constexpr size_t EUReapt = 4;
         using MMAOP = SM80_16x8x16_F32F16F16F32_TN;
-        using type  = Traits<Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
+        using type  = Traits<HeadDim, Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
     };
 
     template <>
     struct DispatchTraits<cutlass::half_t, 128> {
-        static constexpr int Pipe    = 2;
-        static constexpr int QPerCTA = 64;
-        static constexpr int TileSeq = 64;
-        static constexpr int EUReapt = 4;
+        static constexpr size_t HeadDim = 128;
+        static constexpr size_t Pipe    = 2;
+        static constexpr size_t QPerCTA = 64;
+        static constexpr size_t TileSeq = 64;
+        static constexpr size_t EUReapt = 4;
         using MMAOP = SM80_16x8x16_F32F16F16F32_TN;
-        using type  = Traits<Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
+        using type  = Traits<HeadDim, Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
     };
 
     template <>
     struct DispatchTraits<cutlass::bfloat16_t, 32> {
-        static constexpr int Pipe    = 5;
-        static constexpr int QPerCTA = 128;
-        static constexpr int TileSeq = 64;
-        static constexpr int EUReapt = 8;
+        static constexpr size_t HeadDim = 32;
+        static constexpr size_t Pipe    = 5;
+        static constexpr size_t QPerCTA = 128;
+        static constexpr size_t TileSeq = 64;
+        static constexpr size_t EUReapt = 8;
         using MMAOP = SM80_16x8x16_F32BF16BF16F32_TN;
-        using type  = Traits<Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
+        using type  = Traits<HeadDim, Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
     };
 
     template <>
     struct DispatchTraits<cutlass::bfloat16_t, 64> {
-        static constexpr int Pipe    = 5;
-        static constexpr int QPerCTA = 64;
-        static constexpr int TileSeq = 64;
-        static constexpr int EUReapt = 4;
+        static constexpr size_t HeadDim = 64;
+        static constexpr size_t Pipe    = 5;
+        static constexpr size_t QPerCTA = 64;
+        static constexpr size_t TileSeq = 64;
+        static constexpr size_t EUReapt = 4;
         using MMAOP = SM80_16x8x16_F32BF16BF16F32_TN;
-        using type  = Traits<Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
+        using type  = Traits<HeadDim, Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
     };
 
     template <>
     struct DispatchTraits<cutlass::bfloat16_t, 128> {
-        static constexpr int Pipe    = 2;
-        static constexpr int QPerCTA = 64;
-        static constexpr int TileSeq = 64;
-        static constexpr int EUReapt = 4;
+        static constexpr size_t HeadDim = 128;
+        static constexpr size_t Pipe    = 2;
+        static constexpr size_t QPerCTA = 64;
+        static constexpr size_t TileSeq = 64;
+        static constexpr size_t EUReapt = 4;
         using MMAOP = SM80_16x8x16_F32BF16BF16F32_TN;
-        using type  = Traits<Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
+        using type  = Traits<HeadDim, Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
     };
 }

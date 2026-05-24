@@ -1,3 +1,3 @@
-add_executable(FlashAttentionV2 main.cu)
+add_executable(FlashAttentionV2 main.cpp forward_launch.cu)
 
 target_link_libraries(FlashAttentionV2 PRIVATE FlashAttentionUtility)
