@@ -37,13 +37,14 @@ namespace FlashAttention::V2 {
 
         static_assert(std::is_same_v<typename mma_traits::ValTypeA, typename mma_traits::ValTypeB>);
         static_assert(std::is_same_v<typename mma_traits::ValTypeD, typename mma_traits::ValTypeC>);
-        using type          = typename mma_traits::ValTypeA;
-        using acc_type      = typename mma_traits::ValTypeD;
-        using lse_type      = float;
-        using torch_type    = utility::torch_type_of_t<type>;
-        using pointer       = type*;
-        using const_pointer = const type*;
-        using lse_pointer   = float*;
+        using type              = typename mma_traits::ValTypeA;
+        using acc_type          = typename mma_traits::ValTypeD;
+        using lse_type          = float;
+        using torch_type        = utility::torch_type_of_t<type>;
+        using pointer           = type*;
+        using const_pointer     = const type*;
+        using lse_pointer       = float*;
+        using const_lse_pointer = const float*;
 
         static constexpr int AtomM     = get<0>(mma_atom_shape{});
         static constexpr int AtomN     = get<1>(mma_atom_shape{});
@@ -113,23 +114,23 @@ namespace FlashAttention::V2 {
         static constexpr int SwizzleShift = 3;
         static constexpr int SwizzleBits  = utility::log2<8 * SmemColAtom>() - SwizzleShift - SwizzleBase;
 
-        using SmemLayoutAtom          = decltype(
+        using SmemLayoutAtom       = decltype(
             make_layout(Shape<_8, Int<SmemColAtom>>{}, Stride<Int<SmemColAtom>, _1>{})
         );
-        using SmemLayoutNoPipeLogical = decltype(tile_to_shape(
+        using SmemLayoutQOLogical  = decltype(tile_to_shape(
             SmemLayoutAtom{},
             make_shape(Int<TileQ>{}, Int<HeadDim>{})
         ));
-        using SmemLayoutLogical       = decltype(tile_to_shape(
+        using SmemLayoutKVLogical  = decltype(tile_to_shape(
             SmemLayoutAtom{},
             make_shape(Int<TileKV>{}, Int<HeadDim>{}, Int<Stage>{})
         ));
-        using SmemLayoutTLogical      = decltype(select<1, 0, 2>(SmemLayoutLogical{}));
-
-        using SwizzleFn        = Swizzle<SwizzleBits, SwizzleBase, SwizzleShift>;
-        using SmemLayoutNoPipe = decltype(composition(SwizzleFn{}, SmemLayoutNoPipeLogical{}));
-        using SmemLayout       = decltype(composition(SwizzleFn{}, SmemLayoutLogical{}));
-        using SmemLayoutT      = decltype(composition(SwizzleFn{}, SmemLayoutTLogical{}));
+        using SmemLayoutKVTLogical  = decltype(select<1, 0, 2>(SmemLayoutKVLogical{}));
+        
+        using SwizzleFn     = Swizzle<SwizzleBits, SwizzleBase, SwizzleShift>;
+        using SmemLayoutQO  = decltype(composition(SwizzleFn{}, SmemLayoutQOLogical{}));
+        using SmemLayoutKV  = decltype(composition(SwizzleFn{}, SmemLayoutKVLogical{}));
+        using SmemLayoutKVT = decltype(composition(SwizzleFn{}, SmemLayoutKVTLogical{}));
     };
 
     template <typename CutlassType, size_t HeadDim> 
@@ -138,9 +139,9 @@ namespace FlashAttention::V2 {
     template <>
     struct DispatchTraits<cutlass::half_t, 32> {
         static constexpr size_t HeadDim = 32;
-        static constexpr size_t Pipe    = 5;
+        static constexpr size_t Pipe    = 3;
         static constexpr size_t QPerCTA = 128;
-        static constexpr size_t TileSeq = 64;
+        static constexpr size_t TileSeq = 32;
         static constexpr size_t EUReapt = 8;
         using MMAOP = SM80_16x8x16_F32F16F16F32_TN;
         using type  = Traits<HeadDim, Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
@@ -149,9 +150,9 @@ namespace FlashAttention::V2 {
     template <>
     struct DispatchTraits<cutlass::half_t, 64> {
         static constexpr size_t HeadDim = 64;
-        static constexpr size_t Pipe    = 5;
+        static constexpr size_t Pipe    = 3;
         static constexpr size_t QPerCTA = 64;
-        static constexpr size_t TileSeq = 64;
+        static constexpr size_t TileSeq = 32;
         static constexpr size_t EUReapt = 4;
         using MMAOP = SM80_16x8x16_F32F16F16F32_TN;
         using type  = Traits<HeadDim, Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
@@ -162,7 +163,7 @@ namespace FlashAttention::V2 {
         static constexpr size_t HeadDim = 128;
         static constexpr size_t Pipe    = 2;
         static constexpr size_t QPerCTA = 64;
-        static constexpr size_t TileSeq = 64;
+        static constexpr size_t TileSeq = 32;
         static constexpr size_t EUReapt = 4;
         using MMAOP = SM80_16x8x16_F32F16F16F32_TN;
         using type  = Traits<HeadDim, Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
@@ -171,9 +172,9 @@ namespace FlashAttention::V2 {
     template <>
     struct DispatchTraits<cutlass::bfloat16_t, 32> {
         static constexpr size_t HeadDim = 32;
-        static constexpr size_t Pipe    = 5;
+        static constexpr size_t Pipe    = 3;
         static constexpr size_t QPerCTA = 128;
-        static constexpr size_t TileSeq = 64;
+        static constexpr size_t TileSeq = 32;
         static constexpr size_t EUReapt = 8;
         using MMAOP = SM80_16x8x16_F32BF16BF16F32_TN;
         using type  = Traits<HeadDim, Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
@@ -182,9 +183,9 @@ namespace FlashAttention::V2 {
     template <>
     struct DispatchTraits<cutlass::bfloat16_t, 64> {
         static constexpr size_t HeadDim = 64;
-        static constexpr size_t Pipe    = 5;
+        static constexpr size_t Pipe    = 3;
         static constexpr size_t QPerCTA = 64;
-        static constexpr size_t TileSeq = 64;
+        static constexpr size_t TileSeq = 32;
         static constexpr size_t EUReapt = 4;
         using MMAOP = SM80_16x8x16_F32BF16BF16F32_TN;
         using type  = Traits<HeadDim, Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;
@@ -195,7 +196,7 @@ namespace FlashAttention::V2 {
         static constexpr size_t HeadDim = 128;
         static constexpr size_t Pipe    = 2;
         static constexpr size_t QPerCTA = 64;
-        static constexpr size_t TileSeq = 64;
+        static constexpr size_t TileSeq = 32;
         static constexpr size_t EUReapt = 4;
         using MMAOP = SM80_16x8x16_F32BF16BF16F32_TN;
         using type  = Traits<HeadDim, Pipe, QPerCTA, TileSeq, EUReapt, MMAOP>;

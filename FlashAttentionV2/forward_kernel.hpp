@@ -64,17 +64,19 @@ namespace FlashAttention::V2 {
         typename Traits::pointer                out,
         typename Traits::lse_pointer            lse
     ) {        
-        using type      = typename Traits::type;
-        using acc_type  = typename Traits::acc_type;
-        using lse_type  = typename Traits::lse_type;
-        using pointer   = typename Traits::pointer;
-        using MMA       = typename Traits::MMA;
-        using G2SCopy   = typename Traits::G2SCopy;
-        using S2RCopyA  = typename Traits::S2RCopyA;
-        using S2RCopyB  = typename Traits::S2RCopyB;
-        using S2RCopyBT = typename Traits::S2RCopyBT;
-        using R2SCopyC  = typename Traits::R2SCopyC;
-        using S2GCopy   = typename Traits::S2GCopy;
+        using type        = typename Traits::type;
+        using acc_type    = typename Traits::acc_type;
+        using lse_type    = typename Traits::lse_type;
+        using pointer     = typename Traits::pointer;
+        using lse_pointer = typename Traits::lse_pointer;
+
+        using MMA         = typename Traits::MMA;
+        using G2SCopy     = typename Traits::G2SCopy;
+        using S2RCopyA    = typename Traits::S2RCopyA;
+        using S2RCopyB    = typename Traits::S2RCopyB;
+        using S2RCopyBT   = typename Traits::S2RCopyBT;
+        using R2SCopyC    = typename Traits::R2SCopyC;
+        using S2GCopy     = typename Traits::S2GCopy;
 
         static constexpr int HeadDim        = Traits::HeadDim;
         static constexpr int TileQ          = Traits::TileQ;
@@ -87,21 +89,21 @@ namespace FlashAttention::V2 {
         static constexpr int ThreadsPerCol  = Traits::ThreadsPerCol;
         static constexpr int ThreadsPerAtom = Traits::ThreadsPerAtom;
 
-        using SmemLayoutQ           = typename Traits::SmemLayoutNoPipe;
-        using SmemLayoutK           = typename Traits::SmemLayout;
-        using SmemLayoutV           = typename Traits::SmemLayout;
-        using SmemLayoutO           = typename Traits::SmemLayoutNoPipe;
-        using SmemLayoutVT          = typename Traits::SmemLayoutT;
-        using SmemLayoutVNoSwizzle  = typename Traits::SmemLayoutLogical;
-        using SmemLayoutVTNoSwizzle = typename Traits::SmemLayoutTLogical;
+        using SmemLayoutQ           = typename Traits::SmemLayoutQO;
+        using SmemLayoutK           = typename Traits::SmemLayoutKV;
+        using SmemLayoutV           = typename Traits::SmemLayoutKV;
+        using SmemLayoutO           = typename Traits::SmemLayoutQO;
+        using SmemLayoutVT          = typename Traits::SmemLayoutKVT;
+        using SmemLayoutVNoSwizzle  = typename Traits::SmemLayoutKVLogical;
+        using SmemLayoutVTNoSwizzle = typename Traits::SmemLayoutKVTLogical;
         
         extern __shared__ char shared_mem[];
 
         Tensor sQ = make_tensor(make_smem_ptr((pointer)shared_mem), SmemLayoutQ{});
         // (TileQ, HeadDim)
-        Tensor sK = make_tensor(make_smem_ptr((pointer)shared_mem + cosize(SmemLayoutQ{})), SmemLayoutK{});
+        Tensor sK = make_tensor(make_smem_ptr((pointer)shared_mem), SmemLayoutK{});
         // (TileK, HeadDim, Stage)
-        Tensor sV = make_tensor(make_smem_ptr((pointer)shared_mem + cosize(SmemLayoutQ{}) + cosize(SmemLayoutK{})), SmemLayoutV{});
+        Tensor sV = make_tensor(make_smem_ptr((pointer)shared_mem + cosize(SmemLayoutK{})), SmemLayoutV{});
         // (TileV, HeadDim, Stage)
         Tensor sVt = make_tensor(sV.data(), SmemLayoutVT{}); 
         // (HeadDim, TileKV, Stage)
@@ -111,20 +113,14 @@ namespace FlashAttention::V2 {
         auto mx  = make_tensor<acc_type>(Shape<Int<RowsPerThread>, _2>{}); // (RowsPerThread, 2) for old_max, new_max
         auto den = make_tensor<acc_type>(Shape<Int<RowsPerThread>>{});     // (RowsPerThread)  
 
-        Layout GlobalLayout = make_layout(
+        Layout GmemLayout = make_layout(
             make_shape(params.batch_size, params.num_heads, params.seq_len, Int<HeadDim>{}),
             make_stride(params.one_batch_size(), params.one_head_size(), Int<HeadDim>{}, _1{})
         );
-        Tensor Q = make_tensor(make_gmem_ptr(q), GlobalLayout)(blockIdx.x, blockIdx.y, _, _);   // (seq_len, HeadDim)
-        Tensor K = make_tensor(make_gmem_ptr(k), GlobalLayout)(blockIdx.x, blockIdx.y, _, _);   // (seq_len, HeadDim)
-        Tensor V = make_tensor(make_gmem_ptr(v), GlobalLayout)(blockIdx.x, blockIdx.y, _, _);   // (seq_len, HeadDim)
-        Tensor O = make_tensor(make_gmem_ptr(out), GlobalLayout)(blockIdx.x, blockIdx.y, _, _); // (seq_len, HeadDim)
-
-        Layout GmemLayoutLSE = make_layout(
-            make_shape(params.batch_size, params.num_heads, params.seq_len),
-            make_stride(params.num_heads * params.seq_len, params.seq_len, _1{})
-        );
-        Tensor LSE = make_tensor(make_gmem_ptr(lse), GmemLayoutLSE)(blockIdx.x, blockIdx.y, _);
+        Tensor Q = make_tensor(make_gmem_ptr(q), GmemLayout)(blockIdx.x, blockIdx.y, _, _);   // (seq_len, HeadDim)
+        Tensor K = make_tensor(make_gmem_ptr(k), GmemLayout)(blockIdx.x, blockIdx.y, _, _);   // (seq_len, HeadDim)
+        Tensor V = make_tensor(make_gmem_ptr(v), GmemLayout)(blockIdx.x, blockIdx.y, _, _);   // (seq_len, HeadDim)
+        Tensor O = make_tensor(make_gmem_ptr(out), GmemLayout)(blockIdx.x, blockIdx.y, _, _); // (seq_len, HeadDim)
         
         /*
             For batch = blockIdx.x and head = blockIdx.y:
@@ -147,19 +143,19 @@ namespace FlashAttention::V2 {
 
         MMA tiled_mma;
         ThrMMA thr_mma = tiled_mma.get_slice(threadIdx.x);
-        Tensor tSrQ = thr_mma.partition_fragment_A(gQ);                                  // (MMA, MMA_TileQ, MMA_HeadDim)
-        Tensor tSrK = thr_mma.partition_fragment_B(gK(_, _, 0));                         // (MMA, MMA_TileK, MMA_HeadDim)
-        Tensor tSrS = partition_fragment_C(tiled_mma, Shape<Int<TileQ>, Int<TileKV>>{}); // (MMA, MMA_TileQ, MMA_TileK)
-        // tSrS clear in loop
-
-        auto tOrP  = thr_mma.partition_fragment_A(make_tensor<type>(Shape<Int<TileQ>, Int<TileKV>>{}));   
+        Tensor tSrQ = thr_mma.partition_fragment_A(gQ);                     // (MMA, MMA_TileQ, MMA_HeadDim)
+        Tensor tSrK = thr_mma.partition_fragment_B(gK(_, _, 0));            // (MMA, MMA_TileK, MMA_HeadDim)
+        auto   tSrS = thr_mma.partition_fragment_C(make_tensor<acc_type>(Shape<Int<TileQ>, Int<TileKV>>{})); 
+        // tSrS clear in loop                                               // (MMA, MMA_TileQ, MMA_TileK)
+        
+        auto   tOrP  =  thr_mma.partition_fragment_A(make_tensor<type>(Shape<Int<TileQ>, Int<TileKV>>{}));   
                                                                             // (MMA, MMA_TileQ, MMA_TileK)
-        Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle(_, _, 0)); // (MMA, MMA_HeadDim, MMA_TileV)
+        Tensor tOrVt = make_tensor(tSrK.data(), thr_mma.partition_fragment_B(sVtNoSwizzle(_, _, 0)).layout()); 
+                                                                            // (MMA, MMA_HeadDim, MMA_TileK)
         Tensor tOrO  = thr_mma.partition_fragment_C(gO);                    // (MMA, MMA_TileQ, MMA_HeadDim)
         clear(tOrO);
 
         // if (cute::thread0()) {
-        //     print(CLayout{}); printf("\n");
         //     print(tiled_mma.get_layoutC_TV()); printf("\n");
         //     print(tiled_mma.get_layoutC_TV()); printf("\n");
         //     print(tiled_mma.get_layoutC_TV()); printf("\n");
@@ -211,18 +207,24 @@ namespace FlashAttention::V2 {
             tSgQ_g2s_view, tSsQ_g2s_view
         );
         cp_async_fence();
+        cp_async_wait<0>();
+        __syncthreads();
+        copy(s2r_copy_q, tSsQ_s2r_view, tSrQ_s2r_view);
+
         CUTE_UNROLL
-        for (; smem_pipe_write < min(Stage - 1, ceil_div(params.seq_len, TileKV)); global_read++, smem_pipe_write++) {
-            copy_within_boundary<0, TileKV>(
-                g2s_copy_k, params.seq_len, global_read, 
-                thr_g2s_copy_k.partition_S(iK),
-                tSgK_g2s_view(_, _, _, global_read), tSsK_g2s_view(_, _, _, smem_pipe_write)
-            );
-            copy_within_boundary<0, TileKV>(
-                g2s_copy_v, params.seq_len, global_read, 
-                thr_g2s_copy_v.partition_S(iV),
-                tOgV_g2s_view(_, _, _, global_read), tOsV_g2s_view(_, _, _, smem_pipe_write)
-            );
+        for (; smem_pipe_write < Stage - 1; global_read++, smem_pipe_write++) {
+            if (global_read < ceil_div(params.seq_len, TileKV)) {
+                copy_within_boundary<0, TileKV>(
+                    g2s_copy_k, params.seq_len, global_read, 
+                    thr_g2s_copy_k.partition_S(iK),
+                    tSgK_g2s_view(_, _, _, global_read), tSsK_g2s_view(_, _, _, smem_pipe_write)
+                );
+                copy_within_boundary<0, TileKV>(
+                    g2s_copy_v, params.seq_len, global_read, 
+                    thr_g2s_copy_v.partition_S(iV),
+                    tOgV_g2s_view(_, _, _, global_read), tOsV_g2s_view(_, _, _, smem_pipe_write)
+                );
+            }
             cp_async_fence();
         }
         cp_async_wait<Stage - 2>(); // Q is ready
@@ -231,16 +233,12 @@ namespace FlashAttention::V2 {
         int mx_idx = 0; 
         CUTE_UNROLL
         for (int kv_idx = 0; kv_idx < ceil_div(params.seq_len, TileKV); kv_idx++, mx_idx ^= 1) {
-            // clear(tSrS);
             fill_cross_boundary<1, TileKV>(
                 tSrS, params.seq_len, kv_idx, 
                 thr_mma.partition_fragment_C(iS),
                 acc_type{0.0}, numeric_limits<acc_type>::lowest()
-            );
+            ); // as clear(tSrS)
             // Q * K -> S
-            if (kv_idx == 0) {
-                copy(s2r_copy_q, tSsQ_s2r_view(_, _, 0), tSrQ_s2r_view(_, _, 0));
-            }
             copy(s2r_copy_k, tSsK_s2r_view(_, _, 0, smem_pipe_read), tSrK_s2r_view(_, _, 0));
             CUTE_UNROLL
             for (int i = 0; i < size<2>(tSrQ); i++) {
@@ -262,7 +260,6 @@ namespace FlashAttention::V2 {
                     cp_async_fence();
                 }
                 if (i + 1 < size<2>(tSrQ)) {
-                    copy(s2r_copy_q, tSsQ_s2r_view(_, _, i + 1), tSrQ_s2r_view(_, _, i + 1));
                     copy(s2r_copy_k, tSsK_s2r_view(_, _, i + 1, smem_pipe_read), tSrK_s2r_view(_, _, i + 1));
                 }
                 gemm(tiled_mma, tSrS, tSrQ(_, _, i), tSrK(_, _, i), tSrS);
@@ -359,17 +356,26 @@ namespace FlashAttention::V2 {
             thr_s2g_copy_o.partition_D(iO),
             sO_s2g_view, gO_s2g_view
         );
-
-        Tensor gLSE = local_tile(LSE, Tile<Int<TileQ>>{}, make_coord(blockIdx.z));
+        
+        Layout GmemLayoutLSE = make_layout(
+            make_shape(params.batch_size, params.num_heads, params.seq_len),
+            make_stride(params.num_heads * params.seq_len, params.seq_len, _1{})
+        );
+        Tensor LSE  = make_tensor(make_gmem_ptr(lse), GmemLayoutLSE)(blockIdx.x, blockIdx.y, _);
+        Tensor gLSE = local_tile(LSE, Tile<Int<TileQ>>{}, make_coord(blockIdx.z));              // (TileQ)
+        Tensor sLSE = make_tensor(make_smem_ptr((lse_pointer)shared_mem), Shape<Int<TileQ>>{}); // (TileQ)
+        __syncthreads();
         if (threadIdx.x % ThreadsPerRow == 0) {
             for (int i = 0; i < RowsPerThread; i++) {
                 int a = i % size<0, 1>(tOrO), b = i / size<0, 1>(tOrO);
                 int idx = b * PM + threadIdx.x / ThreadsPerAtom * AtomM + 
                           a * ThreadsPerCol + threadIdx.x % ThreadsPerAtom / ThreadsPerRow; 
-                if (blockIdx.z * TileQ + idx < params.seq_len) {
-                    gLSE(idx) = (float)mx(i, mx_idx) * params.scale + logf((float)den(i));
-                }
+                sLSE(idx) = (float)mx(i, mx_idx) * params.scale + logf((float)den(i));
             }
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < TileQ; i += Traits::ThreadsPerCTA) {
+            gLSE(i) = sLSE(i); 
         }
     }
 }

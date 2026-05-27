@@ -62,8 +62,14 @@ namespace FlashAttention::utility {
     }
 
     bool check_equal(torch::Tensor t1, torch::Tensor t2, float tol, int print_count) {
+        std::vector<at::indexing::TensorIndex> t1_slice;
+
+        for (int64_t i = 0; i < t1.dim(); ++i) {
+            t1_slice.push_back(at::indexing::Slice(0, t1.size(i))); 
+        }
+
         auto t1_view = t1.view(-1);
-        auto t2_view = t2.view(-1);
+        auto t2_view = t2.index(t1_slice).view_as(t1_view);
 
         std::cout << "First " << print_count << ":\n";
         std::cout << "t1: ";
@@ -76,7 +82,7 @@ namespace FlashAttention::utility {
         for (int i = 0; i < print_count; i++) {
             std::cout << t2_view[i].item<float>() << " \n"[i == print_count - 1];
         }
-        if (torch::isnan(t1).any().item<bool>() || torch::isnan(t2).any().item<bool>()) {
+        if (torch::isnan(t1_view).any().item<bool>() || torch::isnan(t2_view).any().item<bool>()) {
             std::cout << "Error: NaN detected in tensors!" << std::endl;
             return false;
         }

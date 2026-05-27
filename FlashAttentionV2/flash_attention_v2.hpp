@@ -15,10 +15,12 @@ namespace FlashAttention::V2 {
     );
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> backward_launch(
-        utility::Params params, 
+        utility::Params params,
         torch::Tensor   q,
         torch::Tensor   k,
         torch::Tensor   v,
+        torch::Tensor   out,
+        torch::Tensor   lse,
         torch::Tensor   grad_o
     );
 
@@ -48,7 +50,7 @@ namespace FlashAttention::V2 {
 
             return out; 
         }
-
+        
         static torch::autograd::variable_list backward(
             torch::autograd::AutogradContext *ctx, 
             torch::autograd::variable_list grad_outputs
@@ -75,7 +77,7 @@ namespace FlashAttention::V2 {
                 .head_dim   = grad_o.size(3)
             };
 
-            auto [grad_q, grad_k, grad_v] = backward_launch(params, q, k, v, grad_o);
+            auto [grad_q, grad_k, grad_v] = backward_launch(params, q, k, v, out, lse, grad_o);
 
             return {torch::Tensor(), grad_q, grad_k, grad_v}; 
         }

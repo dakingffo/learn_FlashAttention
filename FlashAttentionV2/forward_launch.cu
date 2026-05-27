@@ -16,19 +16,35 @@ namespace FlashAttention::V2 {
         DISPATCH_TYPE(CutlassType, q.scalar_type(), {
         using Traits = typename DispatchTraits<CutlassType, HeadDim>::type;
         static constexpr int TileQ  = Traits::TileQ;
-        static constexpr int TileKV = Traits::TileKV;
-        static constexpr int Stage  = Traits::Stage;
-        
+
         auto out_options = torch::TensorOptions().dtype(q.dtype()).device(q.device());
         torch::Tensor out = torch::empty({params.batch_size, params.num_heads, params.seq_len, params.head_dim}, out_options);
         auto lse_options = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
-        torch::Tensor lse = torch::empty({params.batch_size, params.num_heads, params.seq_len}, lse_options);
+        torch::Tensor lse = torch::empty({params.batch_size, params.num_heads, cute::ceil_div(params.seq_len, TileQ) * TileQ}, lse_options);
+        params.scale = 1 / std::sqrt(HeadDim);
 
+        // ============================================================================
+        // Forward pass
+        //   Grid: (batch, head, ceil_div(seq_len, TileQ))
+        //   Each CTA computes one TileQ x HeadDim tile of O:
+        //     - Load Q tile into shared memory
+        //     - Loop over KV tiles (pipelined via async copy):
+        //         Load K, V tiles into shared memory
+        //         clear(S)
+        //         S = Q * K^T
+        //         Online softmax: update running mx, den, rescale old accumulator:
+        //         P = softmax(S * scale), O *= exp(mx_old - mx_new), den *= exp(mx_old - mx_new)
+        //         O += P * V
+        //     - Finalize: O /= den, write O and LSE to global memory
+        //   O and LSE are accumulated per Q tile (no atomic needed).
+        // ============================================================================
         dim3 grid(params.batch_size, params.num_heads, cute::ceil_div(params.seq_len, TileQ));
         dim3 block(Traits::ThreadsPerCTA);
-        size_t shared_mem_size = (TileQ * params.head_dim + 2 * TileKV * params.head_dim * Stage) * sizeof(typename Traits::type);
-
-        params.scale = 1 / std::sqrt(HeadDim);
+        size_t shared_mem_size = std::max(
+            1 * cute::cosize(typename Traits::SmemLayoutQO{}), 
+            2 * cute::cosize(typename Traits::SmemLayoutKV{})
+        ) * sizeof(typename Traits::type);
+        
         CUTE_CHECK_ERROR(cudaFuncSetAttribute(
             forward_kernel<Traits>, 
             cudaFuncAttributeMaxDynamicSharedMemorySize, 
