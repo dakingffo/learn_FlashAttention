@@ -1,3 +1,4 @@
+#pragma once
 #include <torch/torch.h>
 
 #define DISPATCH_VALUE(TYPE, NAME, VAL, ...)                                \

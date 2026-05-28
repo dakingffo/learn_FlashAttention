@@ -3,57 +3,10 @@
 #include <cute/algorithm/tensor_reduce.hpp>
 #include <cutlass/numeric_conversion.h>
 
+#include <utility/boundary_algorithm.hpp>
 #include <utility/params.hpp>
 
 namespace FlashAttention::V2 {
-    template <
-        size_t Dim, size_t CTATile, bool FillOutOfBoundary = true,
-        typename TiledCopy, typename Identity,
-        typename SrcTensor, typename DstTensor
-    >
-    CUTE_DEVICE void copy_within_boundary(
-        TiledCopy&& tiled_copy, 
-        signed long len, unsigned int idx, 
-        const Identity& identity,
-        const SrcTensor& src, DstTensor&& dst,
-        typename std::decay_t<DstTensor>::value_type val = typename std::decay_t<DstTensor>::value_type{0.0}
-    ) {
-        if ((idx + 1) * CTATile - 1 < len) {
-            copy(tiled_copy, src, dst);
-        }
-        else {
-            auto mask = make_tensor<bool>(shape(identity));
-            CUTE_UNROLL
-            for (int i = 0; i < size(identity); i++) {
-                bool within_boundary = (idx * CTATile + get<Dim>(identity(i)) < len);
-                mask(i) = within_boundary;
-                if constexpr (FillOutOfBoundary) {
-                    dst(i) = (within_boundary ? dst(i) : val);
-                }
-            }
-            copy_if(tiled_copy, mask, src, dst);
-        }
-    }
-
-    template <size_t Dim, size_t CTATile, typename Tensor, typename Identity>
-    CUTE_DEVICE void fill_cross_boundary(
-        Tensor&& tensor, 
-        signed long len, unsigned int idx,
-        const Identity& identity,
-        typename decay_t<Tensor>::value_type internal,
-        typename decay_t<Tensor>::value_type external
-    ) {
-        if ((idx + 1) * CTATile - 1 < len) {
-            fill(tensor, internal);
-        }
-        else {
-            CUTE_UNROLL
-            for (int i = 0; i < size(identity); i++) {
-                tensor(i) = (idx * CTATile + get<Dim>(identity(i)) < len ? internal : external);
-            }
-        }
-    }
-
     template <typename Traits>
     __global__ __launch_bounds__(Traits::ThreadsPerCTA)
     void backward_dq_kernel(
@@ -135,13 +88,19 @@ namespace FlashAttention::V2 {
         S2RCopyA s2r_copy_o;
         ThrCopy thr_s2r_copy_o = s2r_copy_o.get_slice(threadIdx.x);
 
-        copy(g2s_copy_o, thr_g2s_copy_o.partition_S(gO), thr_g2s_copy_o.partition_D(sO));
+        utility::copy_within_boundary<0, TileQ>(
+            g2s_copy_o, params.seq_len, blockIdx.z, thr_g2s_copy_o.partition_S(iO),
+            thr_g2s_copy_o.partition_S(gO), thr_g2s_copy_o.partition_D(sO)
+        );
         cp_async_fence();
         cp_async_wait<0>();
         __syncthreads();
         copy(s2r_copy_o, thr_s2r_copy_o.partition_S(sO), thr_s2r_copy_o.retile_D(tDrO));
         
-        copy(g2s_copy_o, thr_g2s_copy_o.partition_S(gdO), thr_g2s_copy_o.partition_D(sdO));
+        utility::copy_within_boundary<0, TileQ>(
+            g2s_copy_o, params.seq_len, blockIdx.z, thr_g2s_copy_o.partition_S(iO),
+            thr_g2s_copy_o.partition_S(gdO), thr_g2s_copy_o.partition_D(sdO)
+        );
         cp_async_fence();
         cp_async_wait<0>();
         __syncthreads();
@@ -166,9 +125,10 @@ namespace FlashAttention::V2 {
             }
         }
 
+        int d_len = ceil_div(params.seq_len, TileQ) * TileQ;
         Layout GmemLayoutD = make_layout(
-            make_shape(params.batch_size, params.num_heads, params.seq_len),
-            make_stride(params.num_heads * params.seq_len, params.seq_len, _1{})
+            make_shape(params.batch_size, params.num_heads, d_len),
+            make_stride(params.num_heads * d_len, d_len, _1{})
         );
         Tensor D  = make_tensor(make_gmem_ptr(d), GmemLayoutD)(blockIdx.x, blockIdx.y, _);
         Tensor gD = local_tile(D, Tile<Int<TileQ>>{}, make_coord(blockIdx.z));                // (TileQ)
@@ -191,7 +151,7 @@ namespace FlashAttention::V2 {
         CUTE_UNROLL
         for (int i = threadIdx.x; i < TileQ; i += Traits::ThreadsPerCTA) {
             gD(i) = sD(i);
-            sLSE(i) = gLSE(i);
+            sLSE(i) = (blockIdx.z * TileQ + i < params.seq_len ? gLSE(i) : 0.0f);
         }
         __syncthreads();
         CUTE_UNROLL
@@ -230,28 +190,29 @@ namespace FlashAttention::V2 {
         auto iV = make_identity_tensor(shape(gV(_, _, 0)));
         auto iS = make_identity_tensor(Shape<Int<TileQ>, Int<TileKV>>{});
 
-        // dP = dO * V^T         (dP: reg1, dO: regdO, V : reg0)
+        // dP = dO * V^T         (dP: reg2, dO: regdO, V : reg1)
         auto& tdPrdO = tDrdO;                                              // (MMA, MMA_TileQ, MMA_HeadDim)
-        auto  tdPrV  = make_tensor(tDrO.data(), thr_mma.partition_fragment_B(gV(_, _, 0)).layout());          
+        auto  tdPrV  = thr_mma.partition_fragment_B(gV(_, _, 0));
+        //auto  tdPrV  = make_tensor(tDrO.data(), thr_mma.partition_fragment_B(gV(_, _, 0)).layout());          
                                                                             // (MMA, MMA_TileV, MMA_HeadDim)
         auto  tdPrdP = thr_mma.partition_fragment_C(make_tensor<acc_type>(Shape<Int<TileQ>, Int<TileKV>>{})); 
         // tdPrdP clear in loop                                             // (MMA, MMA_TileQ, MMA_TileV)
         
-        // S = Q * K^T           (S : reg2, Q:  regQ,  K : reg0)
-        Tensor tSrQ = thr_mma.partition_fragment_A(gQ);                   // (MMA, MMA_TileQ, MMA_HeadDim) 
-        auto   tSrK = make_tensor(tDrO.data(), thr_mma.partition_fragment_B(gK(_, _, 0)).layout());    
+        // S = Q * K^T           (S : reg3, Q:  regQ,  K : reg1)
+        Tensor tSrQ = thr_mma.partition_fragment_A(gQ);                   // (MMA, MMA_TileQ, MMA_HeadDim)     
+        auto   tSrK = make_tensor(tdPrV.data(), thr_mma.partition_fragment_B(gK(_, _, 0)).layout());    
                                                                             // (MMA, MMA_TileK, MMA_HeadDim)  
         auto   tSrS = thr_mma.partition_fragment_C(make_tensor<acc_type>(Shape<Int<TileQ>, Int<TileKV>>{})); 
         // tSrS clear in loop                                               // (MMA, MMA_TileQ, MMA_TileK)
 
-        // P = exp(S - LSE)      (P : reg2, S:  reg2,  L : regL)
-        // dS = P ⊙ (dP - D)    (dS: reg2, P:  reg2,  dP: reg1, D: regD)
+        // P = exp(S - LSE)      (P : reg3, S:  reg3,  L : regL)
+        // dS = P ⊙ (dP - D)    (dS: reg0, P:  reg3,  dP: reg2, D: regD)
         auto& tdSrS  = tSrS;
         auto& tdSrdP = tdPrdP;
-        auto& tdSrdS = tSrS;
+        auto  tdSrdS = make_tensor(tDrO.data(), tdSrdP.layout());    
 
-        // dQ += dS * K          (dQ: regdQ, dS: reg3, K : reg0)
-        auto tdQrdS = thr_mma.partition_fragment_A(make_tensor<type>(Shape<Int<TileQ>, Int<TileKV>>{}));  
+        // dQ += dS * K          (dQ: regdQ, dS: reg0, K : reg1)        
+        auto tdQrdS = make_tensor(tdSrdS.data(), thr_mma.partition_fragment_A(make_tensor<type>(Shape<Int<TileQ>, Int<TileKV>>{})).layout());  
                                                                             // (MMA, MMA_TileQ, MMA_TileK)
         auto tdQrKt = make_tensor(tSrK.data(), thr_mma.partition_fragment_B(sKtNoSwizzle(_, _, 0)).layout());  
                                                                             // (MMA, MMA_HeadDim, MMA_TileK)  
@@ -293,7 +254,10 @@ namespace FlashAttention::V2 {
 
         int global_read = 0, smem_pipe_read = 0, smem_pipe_write = 0;
 
-        copy(g2s_copy_q, tSgQ_g2s_view, tSsQ_g2s_view);
+        utility::copy_within_boundary<0, TileQ>(
+            g2s_copy_q, params.seq_len, blockIdx.z, thr_g2s_copy_q.partition_S(iQ), 
+            tSgQ_g2s_view, tSsQ_g2s_view
+        );
         cp_async_fence();
         cp_async_wait<0>();
         __syncthreads();
@@ -302,8 +266,14 @@ namespace FlashAttention::V2 {
         CUTE_UNROLL
         for (; smem_pipe_write < Stage - 1; global_read++, smem_pipe_write++) {
             if (global_read < ceil_div(params.seq_len, TileKV)) {
-                copy(g2s_copy_v, tdPgV_g2s_view(_, _, _, global_read), tdPsV_g2s_view(_, _, _, smem_pipe_write));
-                copy(g2s_copy_k, tSgK_g2s_view(_, _, _, global_read), tSsK_g2s_view(_, _, _, smem_pipe_write));
+                utility::copy_within_boundary<0, TileKV>(
+                    g2s_copy_v, params.seq_len, global_read, thr_g2s_copy_v.partition_S(iV),
+                    tdPgV_g2s_view(_, _, _, global_read), tdPsV_g2s_view(_, _, _, smem_pipe_write)
+                );
+                utility::copy_within_boundary<0, TileKV>(
+                    g2s_copy_k, params.seq_len, global_read, thr_g2s_copy_k.partition_S(iK),
+                    tSgK_g2s_view(_, _, _, global_read), tSsK_g2s_view(_, _, _, smem_pipe_write)
+                );
             }
             cp_async_fence();
         }
@@ -320,8 +290,14 @@ namespace FlashAttention::V2 {
             for (int i = 0; i < size<2>(tdPrdO); i++) {
                 if (i == 0) {
                     if (global_read < ceil_div(params.seq_len, TileKV)) {
-                        copy(g2s_copy_v, tdPgV_g2s_view(_, _, _, global_read), tdPsV_g2s_view(_, _, _, smem_pipe_write));
-                        copy(g2s_copy_k, tSgK_g2s_view(_, _, _, global_read), tSsK_g2s_view(_, _, _, smem_pipe_write));
+                        utility::copy_within_boundary<0, TileKV>(
+                            g2s_copy_v, params.seq_len, global_read, thr_g2s_copy_v.partition_S(iV),
+                            tdPgV_g2s_view(_, _, _, global_read), tdPsV_g2s_view(_, _, _, smem_pipe_write)
+                        );
+                        utility::copy_within_boundary<0, TileKV>(
+                            g2s_copy_k, params.seq_len, global_read, thr_g2s_copy_k.partition_S(iK),
+                            tSgK_g2s_view(_, _, _, global_read), tSsK_g2s_view(_, _, _, smem_pipe_write)
+                        );
                         global_read++;
                         smem_pipe_write = (smem_pipe_write + 1) % Stage;
                     }
@@ -356,7 +332,6 @@ namespace FlashAttention::V2 {
                 );
             }
             // dQ += dS * K
-            copy(tdSrdS, tdQrdS);
             copy(s2r_copy_kt, tdQsKt_s2r_view(_, _, 0, smem_pipe_read), tdQrKt_s2r_view(_, _, 0));
             CUTE_UNROLL
             for (int i = 0; i < size<2>(tdQrdS); i++) {
@@ -365,7 +340,7 @@ namespace FlashAttention::V2 {
                 }
                 gemm(tiled_mma, tdQrdQ, tdQrdS(_, _, i), tdQrKt(_, _, i), tdQrdQ);
             }
-
+            
             smem_pipe_read = (smem_pipe_read + 1) % Stage;
             if (kv_idx + 1 < ceil_div(params.seq_len, TileKV)) {
                 cp_async_wait<Stage - 2>();
@@ -387,6 +362,9 @@ namespace FlashAttention::V2 {
         Tensor sdQ_s2g_view = thr_s2g_copy_dq.partition_S(sdQ); // (COPY, COPY_TileQ, COPY_HeadDim)
         Tensor gdQ_s2g_view = thr_s2g_copy_dq.partition_D(gdQ); // (COPY, COPY_TileQ, COPY_HeadDim)
         __syncthreads();
-        copy(s2g_copy_dq, sdQ_s2g_view, gdQ_s2g_view);
+        utility::copy_within_boundary<0, TileQ, false>(
+            s2g_copy_dq, params.seq_len, blockIdx.z, thr_s2g_copy_dq.partition_D(iQ), 
+            sdQ_s2g_view, gdQ_s2g_view
+        );
     }
 }

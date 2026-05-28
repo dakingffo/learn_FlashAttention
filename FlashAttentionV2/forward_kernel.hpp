@@ -3,57 +3,10 @@
 #include <cute/algorithm/tensor_reduce.hpp>
 #include <cutlass/numeric_conversion.h>
 
+#include <utility/boundary_algorithm.hpp>
 #include <utility/params.hpp>
 
 namespace FlashAttention::V2 {
-    template <
-        size_t Dim, size_t CTATile, bool FillOutOfBoundary = true,
-        typename TiledCopy, typename Identity,
-        typename SrcTensor, typename DstTensor
-    >
-    CUTE_DEVICE void copy_within_boundary(
-        TiledCopy&& tiled_copy, 
-        signed long len, unsigned int idx, 
-        const Identity& identity,
-        const SrcTensor& src, DstTensor&& dst,
-        typename std::decay_t<DstTensor>::value_type val = typename std::decay_t<DstTensor>::value_type{0.0}
-    ) {
-        if ((idx + 1) * CTATile - 1 < len) {
-            copy(tiled_copy, src, dst);
-        }
-        else {
-            auto mask = make_tensor<bool>(shape(identity));
-            CUTE_UNROLL
-            for (int i = 0; i < size(identity); i++) {
-                bool within_boundary = (idx * CTATile + get<Dim>(identity(i)) < len);
-                mask(i) = within_boundary;
-                if constexpr (FillOutOfBoundary) {
-                    dst(i) = (within_boundary ? dst(i) : val);
-                }
-            }
-            copy_if(tiled_copy, mask, src, dst);
-        }
-    }
-
-    template <size_t Dim, size_t CTATile, typename Tensor, typename Identity>
-    CUTE_DEVICE void fill_cross_boundary(
-        Tensor&& tensor, 
-        signed long len, unsigned int idx,
-        const Identity& identity,
-        typename decay_t<Tensor>::value_type internal,
-        typename decay_t<Tensor>::value_type external
-    ) {
-        if ((idx + 1) * CTATile - 1 < len) {
-            fill(tensor, internal);
-        }
-        else {
-            CUTE_UNROLL
-            for (int i = 0; i < size(identity); i++) {
-                tensor(i) = (idx * CTATile + get<Dim>(identity(i)) < len ? internal : external);
-            }
-        }
-    }
-
     template <typename Traits>
     __global__ __launch_bounds__(Traits::ThreadsPerCTA)
     void forward_kernel(
@@ -200,8 +153,7 @@ namespace FlashAttention::V2 {
 
         int global_read = 0, smem_pipe_read = 0, smem_pipe_write = 0;
 
-        // copy(g2s_copy_q, tSgQ_g2s_view, tSsQ_g2s_view);
-        copy_within_boundary<0, TileQ>(
+        utility::copy_within_boundary<0, TileQ>(
             g2s_copy_q, params.seq_len, blockIdx.z, 
             thr_g2s_copy_q.partition_S(iQ),
             tSgQ_g2s_view, tSsQ_g2s_view
@@ -214,14 +166,12 @@ namespace FlashAttention::V2 {
         CUTE_UNROLL
         for (; smem_pipe_write < Stage - 1; global_read++, smem_pipe_write++) {
             if (global_read < ceil_div(params.seq_len, TileKV)) {
-                copy_within_boundary<0, TileKV>(
-                    g2s_copy_k, params.seq_len, global_read, 
-                    thr_g2s_copy_k.partition_S(iK),
+                utility::copy_within_boundary<0, TileKV>(
+                    g2s_copy_k, params.seq_len, global_read, thr_g2s_copy_k.partition_S(iK),
                     tSgK_g2s_view(_, _, _, global_read), tSsK_g2s_view(_, _, _, smem_pipe_write)
                 );
-                copy_within_boundary<0, TileKV>(
-                    g2s_copy_v, params.seq_len, global_read, 
-                    thr_g2s_copy_v.partition_S(iV),
+                utility::copy_within_boundary<0, TileKV>(
+                    g2s_copy_v, params.seq_len, global_read, thr_g2s_copy_v.partition_S(iV),
                     tOgV_g2s_view(_, _, _, global_read), tOsV_g2s_view(_, _, _, smem_pipe_write)
                 );
             }
@@ -233,9 +183,8 @@ namespace FlashAttention::V2 {
         int mx_idx = 0; 
         CUTE_UNROLL
         for (int kv_idx = 0; kv_idx < ceil_div(params.seq_len, TileKV); kv_idx++, mx_idx ^= 1) {
-            fill_cross_boundary<1, TileKV>(
-                tSrS, params.seq_len, kv_idx, 
-                thr_mma.partition_fragment_C(iS),
+            utility::fill_cross_boundary<1, TileKV>(
+                tSrS, params.seq_len, kv_idx, thr_mma.partition_fragment_C(iS),
                 acc_type{0.0}, numeric_limits<acc_type>::lowest()
             ); // as clear(tSrS)
             // Q * K -> S
@@ -244,14 +193,12 @@ namespace FlashAttention::V2 {
             for (int i = 0; i < size<2>(tSrQ); i++) {
                 if (i == 0) {
                     if (global_read < ceil_div(params.seq_len, TileKV)) {
-                        copy_within_boundary<0, TileKV>(
-                            g2s_copy_k, params.seq_len, global_read, 
-                            thr_g2s_copy_k.partition_S(iK),
+                        utility::copy_within_boundary<0, TileKV>(
+                            g2s_copy_k, params.seq_len, global_read, thr_g2s_copy_k.partition_S(iK),
                             tSgK_g2s_view(_, _, _, global_read), tSsK_g2s_view(_, _, _, smem_pipe_write)
                         );
-                        copy_within_boundary<0, TileKV>(
-                            g2s_copy_v, params.seq_len, global_read, 
-                            thr_g2s_copy_v.partition_S(iV),
+                        utility::copy_within_boundary<0, TileKV>(
+                            g2s_copy_v, params.seq_len, global_read, thr_g2s_copy_v.partition_S(iV),
                             tOgV_g2s_view(_, _, _, global_read), tOsV_g2s_view(_, _, _, smem_pipe_write)
                         );
                         global_read++;
@@ -354,15 +301,15 @@ namespace FlashAttention::V2 {
         Tensor sO_s2g_view = thr_s2g_copy_o.partition_S(sO); // (COPY, COPY_TileQ, COPY_HeadDim)
         Tensor gO_s2g_view = thr_s2g_copy_o.partition_D(gO); // (COPY, COPY_TileQ, COPY_HeadDim)
         __syncthreads();
-        copy_within_boundary<0, TileQ, false>(
-            s2g_copy_o, params.seq_len, blockIdx.z, 
-            thr_s2g_copy_o.partition_D(iO),
+        utility::copy_within_boundary<0, TileQ, false>(
+            s2g_copy_o, params.seq_len, blockIdx.z, thr_s2g_copy_o.partition_D(iO),
             sO_s2g_view, gO_s2g_view
         );
         
+        int lse_len = ceil_div(params.seq_len, TileQ) * TileQ;
         Layout GmemLayoutLSE = make_layout(
-            make_shape(params.batch_size, params.num_heads, params.seq_len),
-            make_stride(params.num_heads * params.seq_len, params.seq_len, _1{})
+            make_shape(params.batch_size, params.num_heads, lse_len),
+            make_stride(params.num_heads * lse_len, lse_len, _1{})
         );
         Tensor LSE  = make_tensor(make_gmem_ptr(lse), GmemLayoutLSE)(blockIdx.x, blockIdx.y, _);
         Tensor gLSE = local_tile(LSE, Tile<Int<TileQ>>{}, make_coord(blockIdx.z));              // (TileQ)

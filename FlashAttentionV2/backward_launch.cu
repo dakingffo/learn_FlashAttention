@@ -7,7 +7,7 @@
 #include "backward_kernel.hpp"
 
 namespace FlashAttention::V2 {
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> backward_launch(
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> backward_launch(
         utility::Params params,
         torch::Tensor   q,
         torch::Tensor   k,
@@ -35,17 +35,17 @@ namespace FlashAttention::V2 {
         //   Grid: (batch, head, ceil_div(seq_len, TileQ))
         //   Each CTA computes one TileQ x HeadDim tile of dQ:
         //     - Load dO tile, O tile, into shared memory
-        //          D = dO * O (for each row)           (D: regD,  dO: regdO, O: reg0)
+        //          D = dO * O (vecmul for each row)    (D: regD,  dO: regdO, O: reg0)
         //     - Write D to global memory
         //     - Load Q tile, into shared memory
         //     - Loop over KV tiles (pipelined via async copy):
         //          Load K, V tiles into shared memory
         //          clear(S), clear(dP)
-        //          dP = dO * V^T                       (dP: reg1, dO: regdO, V : reg0)
-        //          Recompute S = Q * K^T               (S : reg2, Q:  regQ,  K : reg0)
-        //          P = exp(S - LSE) (for each row)     (P : reg2, S:  reg2,  L : regL)
-        //          dS = P ⊙ ((dP - D) (for each row)) (dS: reg2, P:  reg2,  dP: reg1, D: regD)
-        //          dQ += dS * K                        (dQ: regdQ, dS: reg3,  K : reg0)
+        //          dP = dO * V^T                       (dP: reg2, dO: regdO, V : reg1)
+        //          Recompute S = Q * K^T               (S : reg3, Q:  regQ,  K : reg1)
+        //          P = exp(S - LSE) (for each row)     (P : reg3, S:  reg3,  L : regL)
+        //          dS = P ⊙ ((dP - D) (for each row)) (dS: reg0, P:  reg3,  dP: reg2, D: regD)
+        //          dQ += dS * K                        (dQ: regdQ, dS: reg0, K : reg1)
         //     - Finalize: write dQ to global memory
         //   dQ is accumulated per Q tile (no atomic needed).
         // ============================================================================
@@ -113,6 +113,6 @@ namespace FlashAttention::V2 {
             // CUTE_CHECK_ERROR(cudaDeviceSynchronize());
         }
 
-        return std::make_tuple(grad_q, grad_k, grad_v, d);
+        return std::make_tuple(grad_q, grad_k, grad_v);
     }))
 }
