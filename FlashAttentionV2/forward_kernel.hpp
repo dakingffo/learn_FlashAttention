@@ -110,8 +110,8 @@ namespace FlashAttention::V2 {
         Tensor sVtNoSwizzle = make_tensor(sV.data(), SmemLayoutVTNoSwizzle{}); 
         // (HeadDim, TileKV, Stage)
 
-        auto mx  = make_tensor<acc_type>(Shape<Int<RowsPerThread>, _2>{}); // (RowsPerThread, 2) for old_max, new_max
-        auto den = make_tensor<acc_type>(Shape<Int<RowsPerThread>>{});     // (RowsPerThread)  
+        auto tMX  = make_tensor<acc_type>(Shape<Int<RowsPerThread>, _2>{}); // (RowsPerThread, 2) for old_max, new_max
+        auto tDEN = make_tensor<acc_type>(Shape<Int<RowsPerThread>>{});     // (RowsPerThread)  
 
         Layout GmemLayout = make_layout(
             make_shape(params.batch_size, params.num_heads, params.seq_len, Int<HeadDim>{}),
@@ -227,7 +227,7 @@ namespace FlashAttention::V2 {
             }
             cp_async_fence();
         }
-        cp_async_wait<Stage - 2>(); // Q is ready
+        cp_async_wait<Stage - 2>();
         __syncthreads();
 
         int mx_idx = 0; 
@@ -269,7 +269,7 @@ namespace FlashAttention::V2 {
             CUTE_UNROLL
             for (int i = 0; i < RowsPerThread; i++) {
                 int a = i % size<0, 1>(tSrS), b = i / size<0, 1>(tSrS);
-                acc_type new_max = (kv_idx != 0 ? mx(i, mx_idx) : numeric_limits<acc_type>::lowest());
+                acc_type new_max = (kv_idx != 0 ? tMX(i, mx_idx) : numeric_limits<acc_type>::lowest());
                 CUTE_UNROLL
                 for (int k = 0; k < size<2>(tSrS); k++)  {
                     CUTE_UNROLL
@@ -281,7 +281,7 @@ namespace FlashAttention::V2 {
                 for (int offset = ThreadsPerRow >> 1; offset; offset >>= 1) {
                     new_max = max(new_max, __shfl_xor_sync(0xffffffff, new_max, offset));
                 }
-                mx(i, mx_idx ^ 1) = new_max;
+                tMX(i, mx_idx ^ 1) = new_max;
 
                 acc_type delta_den = 0.0;
                 cute::transform(
@@ -297,17 +297,17 @@ namespace FlashAttention::V2 {
                     delta_den += __shfl_xor_sync(0xffffffff, delta_den, offset);
                 }
                 if (kv_idx != 0) {
-                    acc_type rescale = expf((mx(i, mx_idx) - new_max) * params.scale);
+                    acc_type rescale = expf((tMX(i, mx_idx) - new_max) * params.scale);
                     cute::transform(
                         tOrO(make_coord(_, a), b, _),
                         [rescale] __device__ (acc_type ele) {
                             return ele * rescale;
                         }
                     );
-                    den(i) = den(i) * rescale + delta_den;
+                    tDEN(i) = tDEN(i) * rescale + delta_den;
                 }
                 else {
-                    den(i) = delta_den;
+                    tDEN(i) = delta_den;
                 }
             }
             
@@ -321,9 +321,12 @@ namespace FlashAttention::V2 {
                 }
                 gemm(tiled_mma, tOrO, tOrP(_, _, i), tOrVt(_, _, i), tOrO);
             }
-            cp_async_wait<Stage - 2>();
-            __syncthreads();
+            
             smem_pipe_read = (smem_pipe_read + 1) % Stage;
+            if (kv_idx + 1 < ceil_div(params.seq_len, TileKV)) {
+                cp_async_wait<Stage - 2>();
+                __syncthreads();
+            }
         }
         
         CUTE_UNROLL
@@ -331,7 +334,7 @@ namespace FlashAttention::V2 {
             int a = i % size<0, 1>(tOrO), b = i / size<0, 1>(tOrO);
             cute::transform(
                 tOrO(make_coord(_, a), b, _),
-                [den = den(i)] __device__ (acc_type ele) {
+                [den = tDEN(i)] __device__ (acc_type ele) {
                     return ele / den;
                 }
             );
@@ -344,7 +347,7 @@ namespace FlashAttention::V2 {
         ThrCopy thr_r2s_copy_o = r2s_copy_o.get_slice(threadIdx.x);
         Tensor rO_r2s_view = thr_r2s_copy_o.retile_S(rO);    // (COPY, COPY_TileQ, COPY_HeadDim)
         Tensor sO_r2s_view = thr_r2s_copy_o.partition_D(sO); // (COPY, COPY_TileQ, COPY_HeadDim)
-        __syncthreads(); // make sure nobody using sO
+        __syncthreads();
         copy(r2s_copy_o, rO_r2s_view, sO_r2s_view);
         S2GCopy s2g_copy_o;
         ThrCopy thr_s2g_copy_o = s2g_copy_o.get_slice(threadIdx.x);
@@ -370,7 +373,7 @@ namespace FlashAttention::V2 {
                 int a = i % size<0, 1>(tOrO), b = i / size<0, 1>(tOrO);
                 int idx = b * PM + threadIdx.x / ThreadsPerAtom * AtomM + 
                           a * ThreadsPerCol + threadIdx.x % ThreadsPerAtom / ThreadsPerRow; 
-                sLSE(idx) = (float)mx(i, mx_idx) * params.scale + logf((float)den(i));
+                sLSE(idx) = (float)tMX(i, mx_idx) * params.scale + logf((float)tDEN(i));
             }
         }
         __syncthreads();
