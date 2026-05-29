@@ -326,8 +326,8 @@ namespace FlashAttention::V2 {
                     tdSrS(make_coord(_, a), b, _),
                     tdSrdP(make_coord(_, a), b, _),
                     tdSrdS(make_coord(_, a), b, _),
-                    [lse = tLSE(i), d = tD(i), scale = params.scale](acc_type s, acc_type dp) {
-                        return expf(s * scale - lse) * (dp - d) * scale /* for dQ += dS * K */;
+                    [lse = tLSE(i), d = tD(i), scale = params.scale] (acc_type s, acc_type dp) {
+                        return type(expf(s * scale - lse) * (dp - d) * scale /* for dQ += dS * K */);
                     }
                 );
             }
@@ -366,5 +366,21 @@ namespace FlashAttention::V2 {
             s2g_copy_dq, params.seq_len, blockIdx.z, thr_s2g_copy_dq.partition_D(iQ), 
             sdQ_s2g_view, gdQ_s2g_view
         );
+    }
+
+    template <typename Traits>
+    __global__ __launch_bounds__(Traits::ThreadsPerCTA)
+    void backward_dkdv_kernel(
+        __grid_constant__ const utility::Params params,
+        typename Traits::const_pointer          q,
+        typename Traits::const_pointer          k,
+        typename Traits::const_pointer          v,
+        typename Traits::const_pointer          out,
+        typename Traits::const_lse_pointer      lse,
+        typename Traits::const_lse_pointer      d,
+        typename Traits::const_pointer          grad_o,
+        typename Traits::pointer                grad_k,
+        typename Traits::pointer                grad_v
+    ) {
     }
 }

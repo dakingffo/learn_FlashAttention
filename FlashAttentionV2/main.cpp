@@ -8,10 +8,10 @@ using namespace FlashAttention::utility;
 
 void test_forward() {
     Params params[4] = {
-        {.batch_size=8, .num_heads=64, .seq_len=2048, .head_dim=64},
-        {.batch_size=8, .num_heads=64, .seq_len=2000, .head_dim=128},
-        {.batch_size=8, .num_heads=64, .seq_len=2048, .head_dim=64},
-        {.batch_size=8, .num_heads=64, .seq_len=2000, .head_dim=128}
+        {.batch_size=4, .num_heads=64, .seq_len=2048, .head_dim=64},
+        {.batch_size=4, .num_heads=64, .seq_len=2000, .head_dim=128},
+        {.batch_size=4, .num_heads=64, .seq_len=2048, .head_dim=64},
+        {.batch_size=4, .num_heads=64, .seq_len=2000, .head_dim=128}
     };
     torch::TensorOptions options[4] = {
         torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA),
@@ -51,7 +51,7 @@ void test_forward() {
 void test_backward() {
     Params params[4] = {
         {.batch_size=4, .num_heads=64, .seq_len=2048, .head_dim=64},
-        {.batch_size=4, .num_heads=64, .seq_len=2000, .head_dim=64},
+        {.batch_size=4, .num_heads=64, .seq_len=2000, .head_dim=128},
         {.batch_size=4, .num_heads=64, .seq_len=2048, .head_dim=64},
         {.batch_size=4, .num_heads=64, .seq_len=2000, .head_dim=128}
     };
@@ -63,7 +63,7 @@ void test_backward() {
     };
 
     std::cout << "=== Backward Test ===" << std::endl;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         printf("[%s] Params{.batch_size=%ld, .num_heads=%ld, .seq_len=%ld, .head_dim=%ld}:\n", 
             (options[i].dtype() == torch::kFloat16 ? "FP16" : "BF16"), 
             params[i].batch_size, params[i].num_heads, params[i].seq_len, params[i].head_dim
@@ -104,7 +104,7 @@ void test_backward() {
 }
 
 int main() {
-    // test_forward();
+    test_forward();
     test_backward();
     return 0;
 }

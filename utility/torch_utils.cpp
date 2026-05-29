@@ -69,7 +69,7 @@ namespace FlashAttention::utility {
         }
 
         auto t1_view = t1.view(-1);
-        auto t2_view = t2.index(t1_slice).view_as(t1_view);
+        auto t2_view = t2.index(t1_slice).contiguous().view_as(t1_view);
 
         std::cout << "First " << print_count << ":\n";
         std::cout << "t1: ";

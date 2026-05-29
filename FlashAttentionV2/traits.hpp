@@ -109,28 +109,37 @@ namespace FlashAttention::V2 {
             make_layout(Shape<_1, Int<sizeof(uint128_t) / sizeof(type)>>{})
         ));
 
-        static constexpr int SmemColAtom  = HeadDim % 64 == 0 ? 64 : 32;
+        static constexpr int SmemHeadAtom = HeadDim % 64 == 0 ? 64 : 32;
+        static constexpr int SmemTileAtom = TileKV % 64 == 0 ? 64 : 32;
         static constexpr int SwizzleBase  = utility::log2<16 / sizeof(type)>();
         static constexpr int SwizzleShift = 3;
+        template <size_t SmemColAtom>
         static constexpr int SwizzleBits  = utility::log2<8 * SmemColAtom>() - SwizzleShift - SwizzleBase;
+        template <size_t SmemColAtom>
+        using SwizzleOf = Swizzle<SwizzleBits<SmemColAtom>, SwizzleBase, SwizzleShift>;
 
-        using SmemLayoutAtom       = decltype(
-            make_layout(Shape<_8, Int<SmemColAtom>>{}, Stride<Int<SmemColAtom>, _1>{})
-        );
         using SmemLayoutQOLogical  = decltype(tile_to_shape(
-            SmemLayoutAtom{},
-            make_shape(Int<TileQ>{}, Int<HeadDim>{})
+            make_layout(Shape<_8, Int<SmemHeadAtom>>{}, Stride<Int<SmemHeadAtom>, _1>{}),
+            Shape<Int<TileQ>, Int<HeadDim>>{}
         ));
+        using SmemLayoutQOTLogical = decltype(select<1, 0>(SmemLayoutQOLogical{}));
         using SmemLayoutKVLogical  = decltype(tile_to_shape(
-            SmemLayoutAtom{},
-            make_shape(Int<TileKV>{}, Int<HeadDim>{}, Int<Stage>{})
+            make_layout(Shape<_8, Int<SmemHeadAtom>>{}, Stride<Int<SmemHeadAtom>, _1>{}),
+            Shape<Int<TileKV>, Int<HeadDim>, Int<Stage>>{}
         ));
-        using SmemLayoutKVTLogical  = decltype(select<1, 0, 2>(SmemLayoutKVLogical{}));
+        using SmemLayoutKVTLogical = decltype(select<1, 0, 2>(SmemLayoutKVLogical{}));
+        using SmemLayoutSPLogical  = decltype(tile_to_shape(
+            make_layout(Shape<_8, Int<SmemTileAtom>>{}, Stride<Int<SmemTileAtom>, _1>{}),
+            Shape<Int<TileQ>, Int<TileKV>>{}
+        ));
+        using SmemLayoutSPTLogical = decltype(select<1, 0>(SmemLayoutSPLogical{}));
         
-        using SwizzleFn     = Swizzle<SwizzleBits, SwizzleBase, SwizzleShift>;
-        using SmemLayoutQO  = decltype(composition(SwizzleFn{}, SmemLayoutQOLogical{}));
-        using SmemLayoutKV  = decltype(composition(SwizzleFn{}, SmemLayoutKVLogical{}));
-        using SmemLayoutKVT = decltype(composition(SwizzleFn{}, SmemLayoutKVTLogical{}));
+        using SmemLayoutQO  = decltype(composition(SwizzleOf<SmemHeadAtom>{}, SmemLayoutQOLogical{}));
+        using SmemLayoutQOT = decltype(composition(SwizzleOf<SmemHeadAtom>{}, SmemLayoutQOTLogical{}));
+        using SmemLayoutKV  = decltype(composition(SwizzleOf<SmemHeadAtom>{}, SmemLayoutKVLogical{}));
+        using SmemLayoutKVT = decltype(composition(SwizzleOf<SmemHeadAtom>{}, SmemLayoutKVTLogical{}));
+        using SmemLayoutSP  = decltype(composition(SwizzleOf<SmemTileAtom>{}, SmemLayoutSPLogical{}));
+        using SmemLayoutSPT = decltype(composition(SwizzleOf<SmemTileAtom>{}, SmemLayoutSPTLogical{}));
     };
 
     template <typename CutlassType, size_t HeadDim> 
