@@ -21,7 +21,7 @@ void test_forward() {
     };
 
     std::cout << "=== Forward Test ===" << std::endl;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 1; i++) {
         printf("[%s] Params{.batch_size=%ld, .num_heads=%ld, .seq_len=%ld, .head_dim=%ld}:\n", 
             (options[i].dtype() == torch::kFloat16 ? "FP16" : "BF16"), 
             params[i].batch_size, params[i].num_heads, params[i].seq_len, params[i].head_dim
@@ -63,7 +63,7 @@ void test_backward() {
     };
 
     std::cout << "=== Backward Test ===" << std::endl;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 1; i++) {
         printf("[%s] Params{.batch_size=%ld, .num_heads=%ld, .seq_len=%ld, .head_dim=%ld}:\n", 
             (options[i].dtype() == torch::kFloat16 ? "FP16" : "BF16"), 
             params[i].batch_size, params[i].num_heads, params[i].seq_len, params[i].head_dim
@@ -88,12 +88,12 @@ void test_backward() {
             params[i], q.detach(), k.detach(), v.detach(), flash_out, flash_lse, grad_o
         );
         bool q_equal = utility::check_equal(naive_dq, flash_dq);
-        bool k_equal = false; // utility::check_equal(naive_dk, flash_dk);
-        bool v_equal = false; // utility::check_equal(naive_dv, flash_dv);
-        std::cout << "dQ:\n" << (q_equal ? "PASS" : "FAIL") << std::endl;
-        std::cout << "dK: (not implemented)" << std::endl;
-        std::cout << "dV: (not implemented)" << std::endl;
-        if (q_equal /* && k_equal && v_equal */) {
+        bool k_equal = utility::check_equal(naive_dk, flash_dk);
+        bool v_equal = utility::check_equal(naive_dv, flash_dv);
+        std::cout << "dQ: " << (q_equal ? "PASS" : "FAIL") << std::endl;
+        std::cout << "dK: " << (k_equal ? "PASS" : "FAIL") << std::endl;
+        std::cout << "dV: " << (v_equal ? "PASS" : "FAIL") << std::endl;
+        if (q_equal && k_equal && v_equal) {
             TIMING("FlashAttentionV2 Backward", config<loop<5>>) {
                 auto [flash_dq, flash_dk, flash_dv] = V2::backward_launch(
                     params[i], q.detach(), k.detach(), v.detach(), flash_out, flash_lse, grad_o

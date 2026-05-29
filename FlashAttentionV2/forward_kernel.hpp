@@ -96,16 +96,16 @@ namespace FlashAttention::V2 {
 
         MMA tiled_mma;
         ThrMMA thr_mma = tiled_mma.get_slice(threadIdx.x);
-        Tensor tSrQ = thr_mma.partition_fragment_A(gQ);                     // (MMA, MMA_TileQ, MMA_HeadDim)
-        Tensor tSrK = thr_mma.partition_fragment_B(gK(_, _, 0));            // (MMA, MMA_TileK, MMA_HeadDim)
-        auto   tSrS = thr_mma.partition_fragment_C(make_tensor<acc_type>(Shape<Int<TileQ>, Int<TileKV>>{})); 
+        auto tSrQ = thr_mma.partition_fragment_A(gQ);                       // (MMA, MMA_TileQ, MMA_HeadDim)
+        auto tSrK = thr_mma.partition_fragment_B(gK(_, _, 0));              // (MMA, MMA_TileK, MMA_HeadDim)
+        auto tSrS = thr_mma.partition_fragment_C(make_tensor<acc_type>(Shape<Int<TileQ>, Int<TileKV>>{})); 
         // tSrS clear in loop                                               // (MMA, MMA_TileQ, MMA_TileK)
         
-        auto   tOrP  =  thr_mma.partition_fragment_A(make_tensor<type>(Shape<Int<TileQ>, Int<TileKV>>{}));   
+        auto tOrP  =  thr_mma.partition_fragment_A(make_tensor<type>(Shape<Int<TileQ>, Int<TileKV>>{}));   
                                                                             // (MMA, MMA_TileQ, MMA_TileK)
-        Tensor tOrVt = make_tensor(tSrK.data(), thr_mma.partition_fragment_B(sVtNoSwizzle(_, _, 0)).layout()); 
+        auto tOrVt = make_tensor(tSrK.data(), thr_mma.partition_fragment_B(sVtNoSwizzle(_, _, 0)).layout()); 
                                                                             // (MMA, MMA_HeadDim, MMA_TileK)
-        Tensor tOrO  = thr_mma.partition_fragment_C(gO);                    // (MMA, MMA_TileQ, MMA_HeadDim)
+        auto tOrO  = thr_mma.partition_fragment_C(gO);                      // (MMA, MMA_TileQ, MMA_HeadDim)
         clear(tOrO);
 
         // if (cute::thread0()) {
@@ -124,44 +124,39 @@ namespace FlashAttention::V2 {
         // __syncthreads();
 
         G2SCopy g2s_copy_q, g2s_copy_k, g2s_copy_v;
+
         ThrCopy thr_g2s_copy_q = g2s_copy_q.get_slice(threadIdx.x);
-        Tensor tSgQ_g2s_view = thr_g2s_copy_q.partition_S(gQ); // (COPY, COPY_TileQ, COPY_HeadDim)
-        Tensor tSsQ_g2s_view = thr_g2s_copy_q.partition_D(sQ); // (COPY, COPY_TileQ, COPY_HeadDim)
-
-        ThrCopy thr_g2s_copy_k = g2s_copy_k.get_slice(threadIdx.x);
-        Tensor tSgK_g2s_view = thr_g2s_copy_k.partition_S(gK); // (COPY, COPY_TileK, COPY_HeadDim, num_tiles_k)
-        Tensor tSsK_g2s_view = thr_g2s_copy_k.partition_D(sK); // (COPY, COPY_TileK, COPY_HeadDim, Stage)
-
-        ThrCopy thr_g2s_copy_v = g2s_copy_v.get_slice(threadIdx.x);
-        Tensor tOgV_g2s_view = thr_g2s_copy_v.partition_S(gV); // (COPY, COPY_TileV, COPY_HeadDim, num_tiles_v)
-        Tensor tOsV_g2s_view = thr_g2s_copy_v.partition_D(sV); // (COPY, COPY_TileV, COPY_HeadDim, Stage)
-
-        S2RCopyA s2r_copy_q;
-        ThrCopy thr_s2r_copy_q = s2r_copy_q.get_slice(threadIdx.x);
-        Tensor tSsQ_s2r_view = thr_s2r_copy_q.partition_S(sQ); // (COPY, COPY_TileQ, COPY_HeadDim)
-        Tensor tSrQ_s2r_view = thr_s2r_copy_q.retile_D(tSrQ);  // (COPY, COPY_TileQ, COPY_HeadDim)
-        
-        S2RCopyB s2r_copy_k;
-        ThrCopy thr_s2r_copy_k = s2r_copy_k.get_slice(threadIdx.x);
-        Tensor tSsK_s2r_view = thr_s2r_copy_k.partition_S(sK); // (COPY, COPY_TileK, COPY_HeadDim, Stage)
-        Tensor tSrK_s2r_view = thr_s2r_copy_k.retile_D(tSrK);  // (COPY, COPY_TileK, COPY_HeadDim)
-        
-        S2RCopyBT s2r_copy_v;
-        ThrCopy thr_s2r_copy_v = s2r_copy_v.get_slice(threadIdx.x);
-        Tensor tOsVt_s2r_view = thr_s2r_copy_v.partition_S(sVt); // (COPY, COPY_HeadDim, COPY_TileV, Stage)
-        Tensor tOrVt_s2r_view = thr_s2r_copy_v.retile_D(tOrVt);  // (COPY, COPY_HeadDim, COPY_TileV)
-
-        int global_read = 0, smem_pipe_read = 0, smem_pipe_write = 0;
-
         utility::copy_within_boundary<0, TileQ>(
             g2s_copy_q, params.seq_len, blockIdx.z, 
             thr_g2s_copy_q.partition_S(iQ),
-            tSgQ_g2s_view, tSsQ_g2s_view
+            thr_g2s_copy_q.partition_S(gQ), thr_g2s_copy_q.partition_D(sQ)
         );
         cp_async_fence();
         cp_async_wait<0>();
         __syncthreads();
-        copy(s2r_copy_q, tSsQ_s2r_view, tSrQ_s2r_view);
+        S2RCopyA s2r_copy_q;
+        ThrCopy thr_s2r_copy_q = s2r_copy_q.get_slice(threadIdx.x);
+        copy(s2r_copy_q, thr_s2r_copy_q.partition_S(sQ), thr_s2r_copy_q.retile_D(tSrQ));
+
+        ThrCopy thr_g2s_copy_k = g2s_copy_k.get_slice(threadIdx.x);
+        auto tSgK_g2s_view = thr_g2s_copy_k.partition_S(gK); // (COPY, COPY_TileK, COPY_HeadDim, num_tiles_k)
+        auto tSsK_g2s_view = thr_g2s_copy_k.partition_D(sK); // (COPY, COPY_TileK, COPY_HeadDim, Stage)
+
+        ThrCopy thr_g2s_copy_v = g2s_copy_v.get_slice(threadIdx.x);
+        auto tOgV_g2s_view = thr_g2s_copy_v.partition_S(gV); // (COPY, COPY_TileV, COPY_HeadDim, num_tiles_v)
+        auto tOsV_g2s_view = thr_g2s_copy_v.partition_D(sV); // (COPY, COPY_TileV, COPY_HeadDim, Stage)
+        
+        S2RCopyB s2r_copy_k;
+        ThrCopy thr_s2r_copy_k = s2r_copy_k.get_slice(threadIdx.x);
+        auto tSsK_s2r_view = thr_s2r_copy_k.partition_S(sK); // (COPY, COPY_TileK, COPY_HeadDim, Stage)
+        auto tSrK_s2r_view = thr_s2r_copy_k.retile_D(tSrK);  // (COPY, COPY_TileK, COPY_HeadDim)
+        
+        S2RCopyBT s2r_copy_v;
+        ThrCopy thr_s2r_copy_v = s2r_copy_v.get_slice(threadIdx.x);
+        auto tOsVt_s2r_view = thr_s2r_copy_v.partition_S(sVt); // (COPY, COPY_HeadDim, COPY_TileV, Stage)
+        auto tOrVt_s2r_view = thr_s2r_copy_v.retile_D(tOrVt);  // (COPY, COPY_HeadDim, COPY_TileV)
+
+        int global_read = 0, smem_pipe_read = 0, smem_pipe_write = 0;
 
         CUTE_UNROLL
         for (; smem_pipe_write < Stage - 1; global_read++, smem_pipe_write++) {

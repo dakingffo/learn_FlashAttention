@@ -17,17 +17,13 @@ namespace FlashAttention::V2 {
         torch::Tensor   grad_o
     )   DISPATCH_VALUE(int, HeadDim, params.head_dim,
         DISPATCH_TYPE(CutlassType, q.scalar_type(), {
-        using Traits = typename DispatchTraits<CutlassType, HeadDim>::type;
-        static constexpr int TileQ  = Traits::TileQ;
-        static constexpr int TileKV = Traits::TileKV;
-        static constexpr int Stage  = Traits::Stage;
-
+        
         auto out_options = torch::TensorOptions().dtype(q.dtype()).device(q.device());
         torch::Tensor grad_q = torch::empty({params.batch_size, params.num_heads, params.seq_len, params.head_dim}, out_options);
         torch::Tensor grad_k = torch::empty({params.batch_size, params.num_heads, params.seq_len, params.head_dim}, out_options);
         torch::Tensor grad_v = torch::empty({params.batch_size, params.num_heads, params.seq_len, params.head_dim}, out_options);
-        auto d_options = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
-        torch::Tensor d = torch::empty({params.batch_size, params.num_heads, cute::ceil_div(params.seq_len, TileQ) * TileQ}, d_options);
+
+        torch::Tensor d = torch::empty_like(lse);
         params.scale = 1 / std::sqrt(HeadDim);
 
         // ============================================================================
@@ -50,11 +46,16 @@ namespace FlashAttention::V2 {
         //   dQ is accumulated per Q tile (no atomic needed).
         // ============================================================================
         {
+            using Traits       = typename DispatchTraits<CutlassType, HeadDim>::QParallel;
+            using SmemLayoutQO = typename Traits::SmemLayoutQO;
+            using SmemLayoutKV = typename Traits::SmemLayoutKV;
+            static constexpr int TileQ = Traits::TileQ;
+
             dim3 grid(params.batch_size, params.num_heads, cute::ceil_div(params.seq_len, TileQ));
             dim3 block(Traits::ThreadsPerCTA);
             size_t shared_mem_size = std::max(
-                1 * cute::cosize(typename Traits::SmemLayoutQO{}), 
-                2 * cute::cosize(typename Traits::SmemLayoutKV{})
+                1 * cute::cosize(SmemLayoutQO{}), 
+                2 * cute::cosize(SmemLayoutKV{})
             ) * sizeof(typename Traits::type);
 
             CUTE_CHECK_ERROR(cudaFuncSetAttribute(
@@ -75,33 +76,38 @@ namespace FlashAttention::V2 {
             );
             CUTE_CHECK_ERROR(cudaDeviceSynchronize());
         }
-
+        /*
         // ============================================================================
         // Pass 2: compute dK and dV
         //   Grid: (batch, head, ceil_div(seq_len, TileKV))
         //   Each CTA computes one TileKV x HeadDim tile of dK and dV:
-        //     - Load K, V tiles, D, LSE into shared memory
+        //     - Load K, V tiles
         //     - loop over Q, dO tiles (pipelined via async copy):
         //          recompute S = Q * K^T               (S : reg1,  Q : reg0,  K : regK)
-        //          P = exp(S - LSE) (for each row)     (P : reg1,  S : reg1,  L : regL)
+        //          P = exp(S - LSE) (for each row)     (P : reg0,  S : reg1,  L : regL)
         //          store P into shared memory, but also keep in register
-        //          dP = dO * V^T                       (dP: reg2,  dO: reg0,  V : regV)
-        //          load P^T into register 
-        //          dS = P ⊙ ((dP - D) (for each row)) (dS: reg1,  P : reg1,  dP: reg2,  D : regD)
-        //          store dS into shared memory
-        //          dV += P^T * dO                      (dV: regdV, P : reg0,  dO: reg2)
-        //          load dS^T into register
-        //          dK += dS^T * Q                      (dK: regdK, dS: reg1,  Q : reg2)
+        //          dP = dO * V^T                       (dP: reg1,  dO: reg2,  V : regV)
+        //          load P^T into register
+        //          dS = P ⊙ ((dP - D) (for each row)) (dS: reg0,  P : reg0,  dP: reg1,  D : regD)
+        //          store dS into shared memory, then load dS^T into register
+        //          dV += P^T * dO                      (dV: regdV, P : reg2,  dO: reg3)
+        //          dK += dS^T * Q                      (dK: regdK, dS: reg0,  Q : reg3)
         //     - Finalize: write dK, dV to global memory
         //   dK and dV is accumulated per KV tile (no atomic needed).
         // ============================================================================
         {
+            using Traits       = typename DispatchTraits<CutlassType, HeadDim>::KVParallel;
+            using SmemLayoutKV = typename Traits::SmemLayoutKV;
+            using SmemLayoutQO = typename Traits::SmemLayoutQO;
+            using SmemLayoutSP = typename Traits::SmemLayoutSP;
+            static constexpr int TileKV = Traits::TileKV;
+
             dim3 grid(params.batch_size, params.num_heads, cute::ceil_div(params.seq_len, TileKV));
             dim3 block(Traits::ThreadsPerCTA);
-            size_t shared_mem_size = (1 * cute::cosize(typename Traits::SmemLayoutSP{}) + std::max(
-                1 * cute::cosize(typename Traits::SmemLayoutQO{}), 
-                2 * cute::cosize(typename Traits::SmemLayoutKV{})
-            ))* sizeof(typename Traits::type);
+            size_t shared_mem_size = (std::max(
+                1 * cute::cosize(SmemLayoutKV{}), 
+                2 * cute::cosize(SmemLayoutQO{})
+            ) + 1 * cute::cosize(SmemLayoutSP{})) * sizeof(typename Traits::type);
 
             CUTE_CHECK_ERROR(cudaFuncSetAttribute(
                 backward_dkdv_kernel<Traits>,
@@ -113,16 +119,16 @@ namespace FlashAttention::V2 {
                 (typename Traits::const_pointer)q.data_ptr<typename Traits::torch_type>(),
                 (typename Traits::const_pointer)k.data_ptr<typename Traits::torch_type>(),
                 (typename Traits::const_pointer)v.data_ptr<typename Traits::torch_type>(),
-                (typename Traits::const_pointer)out.data_ptr<typename Traits::torch_type>(),
                 (typename Traits::const_lse_pointer)lse.data_ptr<typename Traits::lse_type>(),
                 (typename Traits::const_lse_pointer)d.data_ptr<typename Traits::lse_type>(),
                 (typename Traits::const_pointer)grad_o.data_ptr<typename Traits::torch_type>(),
                 (typename Traits::pointer)grad_k.data_ptr<typename Traits::torch_type>(),
-                (typename Traits::pointer)grad_v.data_ptr<typename Traits::torch_type>()
+                (typename Traits::pointer)grad_v.data_ptr<typename Traits::torch_type>(),
+                (int)d.size(2)
             );
             CUTE_CHECK_ERROR(cudaDeviceSynchronize());
         }
-
+        */
         return std::make_tuple(grad_q, grad_k, grad_v);
     }))
 }
