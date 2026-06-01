@@ -6,7 +6,7 @@
     switch (VAL) {                                                          \
     /*case 32  : {static constexpr TYPE NAME = 32;  __VA_ARGS__; break; } */ \
     case 64  : { static constexpr TYPE NAME = 64;  __VA_ARGS__; break; }    \
-    /*case 128 : { static constexpr TYPE NAME = 128; __VA_ARGS__; break; } */ \
+    case 128 : { static constexpr TYPE NAME = 128; __VA_ARGS__; break; }    \
     default  : C10_THROW_ERROR(ValueError, "Unsupported value");            \
     }                                                                       \
 }

@@ -21,7 +21,7 @@ void test_forward() {
     };
 
     std::cout << "=== Forward Test ===" << std::endl;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         printf("[%s] Params{.batch_size=%ld, .num_heads=%ld, .seq_len=%ld, .head_dim=%ld}:\n", 
             (options[i].dtype() == torch::kFloat16 ? "FP16" : "BF16"), 
             params[i].batch_size, params[i].num_heads, params[i].seq_len, params[i].head_dim
@@ -63,7 +63,7 @@ void test_backward() {
     };
 
     std::cout << "=== Backward Test ===" << std::endl;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         printf("[%s] Params{.batch_size=%ld, .num_heads=%ld, .seq_len=%ld, .head_dim=%ld}:\n", 
             (options[i].dtype() == torch::kFloat16 ? "FP16" : "BF16"), 
             params[i].batch_size, params[i].num_heads, params[i].seq_len, params[i].head_dim
