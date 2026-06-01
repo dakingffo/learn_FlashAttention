@@ -76,7 +76,7 @@ namespace FlashAttention::V2 {
             );
             CUTE_CHECK_ERROR(cudaDeviceSynchronize());
         }
-        /*
+        
         // ============================================================================
         // Pass 2: compute dK and dV
         //   Grid: (batch, head, ceil_div(seq_len, TileKV))
@@ -84,13 +84,13 @@ namespace FlashAttention::V2 {
         //     - Load K, V tiles
         //     - loop over Q, dO tiles (pipelined via async copy):
         //          recompute S = Q * K^T               (S : reg1,  Q : reg0,  K : regK)
-        //          P = exp(S - LSE) (for each row)     (P : reg0,  S : reg1,  L : regL)
+        //          P = exp(S - LSE) (for each row)     (P : reg2,  S : reg1,  L : regL)
         //          store P into shared memory, but also keep in register
-        //          dP = dO * V^T                       (dP: reg1,  dO: reg2,  V : regV)
+        //          dP = dO * V^T                       (dP: reg1,  dO: reg0,  V : regV)
         //          load P^T into register
-        //          dS = P ⊙ ((dP - D) (for each row)) (dS: reg0,  P : reg0,  dP: reg1,  D : regD)
-        //          store dS into shared memory, then load dS^T into register
-        //          dV += P^T * dO                      (dV: regdV, P : reg2,  dO: reg3)
+        //          dS = P ⊙ ((dP - D) (for each row)) (dS: reg2,  P : reg2,  dP: reg1,  D : regD)
+        //          dV += P^T * dO                      (dV: regdV, P : reg0,  dO: reg3)
+        //          store dS into shared memory, load dS^T into register
         //          dK += dS^T * Q                      (dK: regdK, dS: reg0,  Q : reg3)
         //     - Finalize: write dK, dV to global memory
         //   dK and dV is accumulated per KV tile (no atomic needed).
@@ -128,7 +128,7 @@ namespace FlashAttention::V2 {
             );
             CUTE_CHECK_ERROR(cudaDeviceSynchronize());
         }
-        */
+        
         return std::make_tuple(grad_q, grad_k, grad_v);
     }))
 }
