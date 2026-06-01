@@ -27,7 +27,7 @@
 │   ├── backward_launch.cu       # 反向传播 Host 端 Launch 逻辑
 │   ├── backward_kernel.hpp      # 反向传播 Device 端 Kernel 实现 (dQ, dK, dV)
 │   ├── boundary_algorithm.hpp   # 跨边界内存读取与越界填充 (Masking & Padding) 逻辑
-|   └── CMakeLists.txt           # Cmake子目录
+|   └── CMakeLists.txt           # CMake子目录
 └── CMakeLists.txt               # 编译配置
 ```
 ## FlashAttentionV3
