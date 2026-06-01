@@ -20,7 +20,7 @@ namespace FlashAttention::V2 {
     };
 
     template <
-        size_t Dim, size_t Pipe, size_t TileParallel, size_t TileSequence, size_t EUReapt,
+        size_t Dim, size_t Pipe, size_t TileParallel, size_t TileSequence,
         typename MMAOP /* = SM80_16x8x16_F32BF16BF16F32_TN */
     >
     struct Traits {
@@ -69,8 +69,8 @@ namespace FlashAttention::V2 {
             static constexpr int AtomM     = get<0>(mma_atom_shape{});
             static constexpr int AtomN     = get<1>(mma_atom_shape{});
             static constexpr int AtomK     = get<2>(mma_atom_shape{}); // only one warp
-            static constexpr int EURepeatM = EUReapt;
             static constexpr int PermuteN  = get<2>(mma_atom_shape{}) / get<1>(mma_atom_shape{});
+            static constexpr int EURepeatM = TileQ / AtomM;
             static constexpr int PM        = EURepeatM * AtomM;
             static constexpr int PN        = PermuteN * AtomN;
             static constexpr int PK        = AtomK; // only one warp
@@ -85,8 +85,6 @@ namespace FlashAttention::V2 {
 
             static constexpr int ThreadsPerRow  = size<0, 0>(CLayout{});
             static constexpr int RowsPerThread  = size<1, 1>(CLayout{}) * TileQ / PM;
-            static constexpr int ThreadsPerCol  = size<0, 1>(CLayout{});
-            static constexpr int ThreadsPerAtom = ThreadsPerRow * ThreadsPerCol;
             static constexpr int ThreadsPerCTA  = thr_size(MMA{});
 
             using CopyThreadsLayout = decltype(make_layout(Shape<Int<ThreadsPerCTA / 4>, _4>{}, Stride<_4, _1>{}));
@@ -165,24 +163,26 @@ namespace FlashAttention::V2 {
             static constexpr int AtomM     = get<0>(mma_atom_shape{});
             static constexpr int AtomN     = get<1>(mma_atom_shape{});
             static constexpr int AtomK     = get<2>(mma_atom_shape{}); // only one warp
-            static constexpr int EURepeatN = 1; // maybe optimized in future
             static constexpr int PermuteN  = get<2>(mma_atom_shape{}) / get<1>(mma_atom_shape{});
+            static constexpr int EURepeatN = TileKV / (AtomN * PermuteN);
             static constexpr int PM        = AtomM;
             static constexpr int PN        = PermuteN * AtomN;
             static constexpr int PK        = AtomK; // only one warp
             static_assert(TileQ >= PM && TileKV >= PN);
 
             using CLayout = typename mma_traits::CLayout;
+            using PermuteLayoutN = decltype(make_layout(
+                Shape<Int<AtomN>, Int<EURepeatN>, Int<PermuteN>>{},
+                Stride<_1, Int<AtomN * PermuteN>, Int<AtomN>>{}
+            ));
             using MMA     = decltype(make_tiled_mma(
                 mma_op{},
                 make_layout(Shape<_1, Int<EURepeatN>, _1>{}),
-                Tile<Int<PM>, Int<PN>, Int<PK>>{}
+                Tile<Int<PM>, PermuteLayoutN, Int<PK>>{}
             ));
 
             static constexpr int ThreadsPerRow  = size<0, 0>(CLayout{});
             static constexpr int RowsPerThread  = size<1, 1>(CLayout{}) * TileQ / PM;
-            static constexpr int ThreadsPerCol  = size<0, 1>(CLayout{});
-            static constexpr int ThreadsPerAtom = ThreadsPerRow * ThreadsPerCol;
             static constexpr int ThreadsPerCTA  = thr_size(MMA{});
 
             using CopyThreadsLayout = decltype(make_layout(Shape<Int<ThreadsPerCTA / 4>, _4>{}, Stride<_4, _1>{}));
@@ -270,10 +270,9 @@ namespace FlashAttention::V2 {
         static constexpr size_t Pipe         = 3;
         static constexpr size_t TileParallel = 128;
         static constexpr size_t TileSequence = 32;
-        static constexpr size_t EUReapt      = 8;
         using MMAOP      = SM80_16x8x16_F32F16F16F32_TN;
-        using QParallel  = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, EUReapt, MMAOP>::QParallel;
-        using KVParallel = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, EUReapt, MMAOP>::KVParallel;
+        using QParallel  = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, MMAOP>::QParallel;
+        using KVParallel = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, MMAOP>::KVParallel;
     };
 
     template <>
@@ -282,10 +281,9 @@ namespace FlashAttention::V2 {
         static constexpr size_t Pipe         = 3;
         static constexpr size_t TileParallel = 64;
         static constexpr size_t TileSequence = 32;
-        static constexpr size_t EUReapt      = 4;
         using MMAOP = SM80_16x8x16_F32F16F16F32_TN;
-        using QParallel  = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, EUReapt, MMAOP>::QParallel;
-        using KVParallel = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, EUReapt, MMAOP>::KVParallel;
+        using QParallel  = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, MMAOP>::QParallel;
+        using KVParallel = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, MMAOP>::KVParallel;
     };
 
     template <>
@@ -294,10 +292,9 @@ namespace FlashAttention::V2 {
         static constexpr size_t Pipe         = 2;
         static constexpr size_t TileParallel = 64;
         static constexpr size_t TileSequence = 32;
-        static constexpr size_t EUReapt      = 4;
         using MMAOP = SM80_16x8x16_F32F16F16F32_TN;
-        using QParallel  = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, EUReapt, MMAOP>::QParallel;
-        using KVParallel = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, EUReapt, MMAOP>::KVParallel;
+        using QParallel  = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, MMAOP>::QParallel;
+        using KVParallel = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, MMAOP>::KVParallel;
     };
 
     template <>
@@ -306,10 +303,9 @@ namespace FlashAttention::V2 {
         static constexpr size_t Pipe         = 3;
         static constexpr size_t TileParallel = 128;
         static constexpr size_t TileSequence = 32;
-        static constexpr size_t EUReapt      = 8;
         using MMAOP = SM80_16x8x16_F32BF16BF16F32_TN;
-        using QParallel  = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, EUReapt, MMAOP>::QParallel;
-        using KVParallel = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, EUReapt, MMAOP>::KVParallel;
+        using QParallel  = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, MMAOP>::QParallel;
+        using KVParallel = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, MMAOP>::KVParallel;
     };
 
     template <>
@@ -318,10 +314,9 @@ namespace FlashAttention::V2 {
         static constexpr size_t Pipe         = 3;
         static constexpr size_t TileParallel = 64;
         static constexpr size_t TileSequence = 32;
-        static constexpr size_t EUReapt      = 4;
         using MMAOP = SM80_16x8x16_F32BF16BF16F32_TN;
-        using QParallel  = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, EUReapt, MMAOP>::QParallel;
-        using KVParallel = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, EUReapt, MMAOP>::KVParallel;
+        using QParallel  = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, MMAOP>::QParallel;
+        using KVParallel = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, MMAOP>::KVParallel;
     };
 
     template <>
@@ -330,9 +325,8 @@ namespace FlashAttention::V2 {
         static constexpr size_t Pipe         = 2;
         static constexpr size_t TileParallel = 64;
         static constexpr size_t TileSequence = 32;
-        static constexpr size_t EUReapt      = 4;
         using MMAOP = SM80_16x8x16_F32BF16BF16F32_TN;
-        using QParallel  = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, EUReapt, MMAOP>::QParallel;
-        using KVParallel = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, EUReapt, MMAOP>::KVParallel;
+        using QParallel  = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, MMAOP>::QParallel;
+        using KVParallel = typename Traits<HeadDim, Pipe, TileParallel, TileSequence, MMAOP>::KVParallel;
     };
 }

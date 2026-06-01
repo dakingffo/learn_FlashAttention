@@ -35,12 +35,9 @@ namespace FlashAttention::V2 {
         static constexpr int TileQ          = Traits::TileQ;
         static constexpr int TileKV         = Traits::TileKV;
         static constexpr int Stage          = Traits::Stage;
-        static constexpr int AtomM          = Traits::AtomM;
-        static constexpr int PM             = Traits::PM;
         static constexpr int ThreadsPerRow  = Traits::ThreadsPerRow;
         static constexpr int RowsPerThread  = Traits::RowsPerThread;
-        static constexpr int ThreadsPerCol  = Traits::ThreadsPerCol;
-        static constexpr int ThreadsPerAtom = Traits::ThreadsPerAtom;
+        static constexpr int ThreadsPerCTA  = Traits::ThreadsPerCTA;
 
         using SmemLayoutQ           = typename Traits::SmemLayoutQO;
         using SmemLayoutK           = typename Traits::SmemLayoutKV;
@@ -100,7 +97,11 @@ namespace FlashAttention::V2 {
         auto tSrK = thr_mma.partition_fragment_B(gK(_, _, 0));              // (MMA, MMA_TileK, MMA_HeadDim)
         auto tSrS = thr_mma.partition_fragment_C(make_tensor<acc_type>(Shape<Int<TileQ>, Int<TileKV>>{})); 
         // tSrS clear in loop                                               // (MMA, MMA_TileQ, MMA_TileK)
-        
+        auto tSiS = thr_mma.partition_C(iS);                                // (MMA, MMA_TileQ, MMA_TileK)
+
+        auto& tPrS = tSrS;                                                  // (MMA, MMA_TileQ, MMA_TileK)
+        auto& tPrP = tSrS;                                                  // (MMA, MMA_TileQ, MMA_TileK)    
+
         auto tOrP  =  thr_mma.partition_fragment_A(make_tensor<type>(Shape<Int<TileQ>, Int<TileKV>>{}));   
                                                                             // (MMA, MMA_TileQ, MMA_TileK)
         auto tOrVt = make_tensor(tSrK.data(), thr_mma.partition_fragment_B(sVtNoSwizzle(_, _, 0)).layout()); 
@@ -178,10 +179,7 @@ namespace FlashAttention::V2 {
         int mx_idx = 0; 
         CUTE_UNROLL
         for (int kv_idx = 0; kv_idx < ceil_div(params.seq_len, TileKV); kv_idx++, mx_idx ^= 1) {
-            utility::fill_cross_boundary<1, TileKV>(
-                tSrS, params.seq_len, kv_idx, thr_mma.partition_fragment_C(iS),
-                acc_type{0.0}, numeric_limits<acc_type>::lowest()
-            ); // as clear(tSrS)
+            clear(tSrS);
             // Q * K -> S
             copy(s2r_copy_k, tSsK_s2r_view(_, _, 0, smem_pipe_read), tSrK_s2r_view(_, _, 0));
             CUTE_UNROLL
@@ -225,11 +223,14 @@ namespace FlashAttention::V2 {
                 }
                 tMX(i, mx_idx ^ 1) = new_max;
 
+                int row = get<0>(tSiS(make_coord(0, a), b, 0)), col = get<1>(tSiS(make_coord(0, a), b, 0));
+                bool within_boundary = (blockIdx.z * TileQ + row < params.seq_len && kv_idx * TileKV + col < params.seq_len);
                 acc_type delta_den = 0.0;
                 cute::transform(
-                    tSrS(make_coord(_, a), b, _),
-                    [new_max, &delta_den, scale = params.scale] __device__ (acc_type ele) { 
-                        acc_type exp_ele = expf((ele - new_max) * scale);
+                    tPrS(make_coord(_, a), b, _),
+                    tPrP(make_coord(_, a), b, _),
+                    [new_max, &delta_den, scale = params.scale, within_boundary] __device__ (acc_type ele) { 
+                        acc_type exp_ele = acc_type(within_boundary ? expf((ele - new_max) * scale) : 0.0f);
                         delta_den += exp_ele;
                         return exp_ele;
                     }
@@ -309,17 +310,17 @@ namespace FlashAttention::V2 {
         Tensor LSE  = make_tensor(make_gmem_ptr(lse), GmemLayoutLSE)(blockIdx.x, blockIdx.y, _);
         Tensor gLSE = local_tile(LSE, Tile<Int<TileQ>>{}, make_coord(blockIdx.z));              // (TileQ)
         Tensor sLSE = make_tensor(make_smem_ptr((lse_pointer)shared_mem), Shape<Int<TileQ>>{}); // (TileQ)
+        auto tOiO = thr_mma.partition_C(iO);                 // (MMA, MMA_TileQ, MMA_HeadDim)
         __syncthreads();
         if (threadIdx.x % ThreadsPerRow == 0) {
             for (int i = 0; i < RowsPerThread; i++) {
                 int a = i % size<0, 1>(tOrO), b = i / size<0, 1>(tOrO);
-                int idx = b * PM + threadIdx.x / ThreadsPerAtom * AtomM + 
-                          a * ThreadsPerCol + threadIdx.x % ThreadsPerAtom / ThreadsPerRow; 
-                sLSE(idx) = (float)tMX(i, mx_idx) * params.scale + logf((float)tDEN(i));
+                int row = get<0>(tOiO(make_coord(0, a), b, 0));
+                sLSE(row) = (float)tMX(i, mx_idx) * params.scale + logf((float)tDEN(i));
             }
         }
         __syncthreads();
-        for (int i = threadIdx.x; i < TileQ; i += Traits::ThreadsPerCTA) {
+        for (int i = threadIdx.x; i < TileQ; i += ThreadsPerCTA) {
             gLSE(i) = sLSE(i); 
         }
     }
