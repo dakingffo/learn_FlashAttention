@@ -132,12 +132,6 @@ void test_function() {
                 torch::Tensor v_t = v_base.clone().requires_grad_(true);
                 V2::Function::apply(q_t, k_t, v_t).sum().backward();
             };
-            TIMING("TorchAttention", config<loop<5>>) {
-                torch::Tensor q_t = q_base.clone().requires_grad_(true);
-                torch::Tensor k_t = k_base.clone().requires_grad_(true);
-                torch::Tensor v_t = v_base.clone().requires_grad_(true);
-                torch::scaled_dot_product_attention(q_t, k_t, v_t).sum().backward();
-            };
         }
     }
 }
