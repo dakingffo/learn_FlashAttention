@@ -23,10 +23,10 @@
 │   ├── main.cpp                 # 测试入口：精度校验与性能 benchmark (PyTorch Naive vs CuTe)
 │   ├── traits.hpp               # 核心静态分发配置：定义 FWD/BWD 的 Tile 大小、MMA 刀模与 Smem Layout
 │   ├── forward_launch.cu        # 前向传播 Host 端 Launch 逻辑
-│   ├── forward_kernel.hpp       # 前向传播 Device 端 Kernel 实现 (Online Softmax)
+│   ├── forward_kernel.hpp       # 前向传播 Device 端 Kernel 实现
 │   ├── backward_launch.cu       # 反向传播 Host 端 Launch 逻辑
-│   ├── backward_kernel.hpp      # 反向传播 Device 端 Kernel 实现 (dQ, dK, dV)
-│   ├── boundary_algorithm.hpp   # 跨边界内存读取与越界填充 (Masking & Padding) 逻辑
+│   ├── backward_kernel.hpp      # 反向传播 Device 端 Kernel 实现
+│   ├── flash_attention_v2.hpp   # 接口头文件
 |   └── CMakeLists.txt           # CMake子目录
 └── CMakeLists.txt               # 编译配置
 ```
