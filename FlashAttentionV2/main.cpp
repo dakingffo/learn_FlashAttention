@@ -103,8 +103,45 @@ void test_backward() {
     }
 }
 
+void test_function() {
+    std::cout << "=== Autograd Function Test ===" << std::endl;
+    {
+        Params params{.batch_size=4, .num_heads=8, .seq_len=512, .head_dim=64};
+        auto options = torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA);
+
+        // Create base tensors, then clone for independent autograd paths
+        torch::Tensor q_base = torch::randn({params.batch_size, params.num_heads, params.seq_len, params.head_dim}, options);
+        torch::Tensor k_base = torch::randn({params.batch_size, params.num_heads, params.seq_len, params.head_dim}, options);
+        torch::Tensor v_base = torch::randn({params.batch_size, params.num_heads, params.seq_len, params.head_dim}, options);
+
+        // Flash: full autograd through Function::apply
+        torch::Tensor q = q_base.clone().requires_grad_(true);
+        torch::Tensor k = k_base.clone().requires_grad_(true);
+        torch::Tensor v = v_base.clone().requires_grad_(true);
+
+        torch::Tensor flash_out = V2::Function::apply(q, k, v);
+        flash_out.sum().backward();
+
+        // Reference: naive_attention autograd (same data, independent graph)
+        torch::Tensor q2 = q_base.clone().requires_grad_(true);
+        torch::Tensor k2 = k_base.clone().requires_grad_(true);
+        torch::Tensor v2 = v_base.clone().requires_grad_(true);
+
+        torch::Tensor naive_out = naive_attention(q2, k2, v2);
+        naive_out.sum().backward();
+
+        bool q_ok = utility::check_equal(q2.grad(), q.grad());
+        bool k_ok = utility::check_equal(k2.grad(), k.grad());
+        bool v_ok = utility::check_equal(v2.grad(), v.grad());
+        std::cout << "  dQ: " << (q_ok ? "PASS" : "FAIL") << std::endl;
+        std::cout << "  dK: " << (k_ok ? "PASS" : "FAIL") << std::endl;
+        std::cout << "  dV: " << (v_ok ? "PASS" : "FAIL") << std::endl;
+    }
+}
+
 int main() {
     test_forward();
     test_backward();
+    test_function();
     return 0;
 }

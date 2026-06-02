@@ -46,13 +46,13 @@ namespace FlashAttention::V2 {
             };
             auto [out, lse] = forward_launch(params, q, k, v);
 
-            ctx->save_for_backward({q, k, v, out, lse});
+            ctx->save_for_backward({q.detach(), k.detach(), v.detach(), out, lse});
 
             return out; 
         }
 
         static torch::autograd::variable_list backward(
-            torch::autograd::AutogradContext *ctx, 
+            torch::autograd::AutogradContext *ctx,
             torch::autograd::variable_list grad_outputs
         ) {
             torch::Tensor grad_o = grad_outputs[0];
@@ -71,15 +71,19 @@ namespace FlashAttention::V2 {
             TORCH_CHECK(q.dtype() == grad_o.dtype());
 
             utility::Params params{
-                .batch_size = grad_o.size(0), 
-                .num_heads  = grad_o.size(1), 
-                .seq_len    = grad_o.size(2), 
+                .batch_size = grad_o.size(0),
+                .num_heads  = grad_o.size(1),
+                .seq_len    = grad_o.size(2),
                 .head_dim   = grad_o.size(3)
             };
 
-            auto [grad_q, grad_k, grad_v] = backward_launch(params, q, k, v, out, lse, grad_o);
+            // grad_o from autograd may be non-contiguous; backward_launch needs contiguous
+            auto [grad_q, grad_k, grad_v] = backward_launch(
+                params,
+                q, k, v, out, lse,
+                grad_o.contiguous());
 
-            return {torch::Tensor(), grad_q, grad_k, grad_v}; 
+            return {grad_q, grad_k, grad_v};
         }
     };
 }
