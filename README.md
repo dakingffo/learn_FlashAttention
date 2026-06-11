@@ -1,8 +1,8 @@
 # learn_FlashAttention (CuTe Learning Project)
 
-这是一个基于 C++/CUDA 和 CuTe 库从零手写的 FlashAttention-2 学习项目，包含了完整的前向（Forward）和反向（Backward）传播内核实现。
+这是一个基于 CUDA C++ 和 CUTLASS/CuTe 库从零手写的 FlashAttention 学习项目，包含了完整的 Forward 和 Backward 传播内核实现。
 
-本项目主要用于深入学习 GPU 底层架构、CuTe Layout 几何代数映射以及高性能算子开发，不以通用开源库的工程化封装为目的。
+本项目主要用于深入理解 GPU 体系结构、CuTe Layout 代数以及复杂算子开发，不以通用开源库的工程化封装为目的。
 
 
 ## FlashAttentionV2
