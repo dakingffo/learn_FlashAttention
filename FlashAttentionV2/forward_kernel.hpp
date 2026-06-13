@@ -2,6 +2,8 @@
 #include <cute/algorithm/tensor_algorithms.hpp>
 #include <cute/algorithm/tensor_reduce.hpp>
 #include <cutlass/numeric_conversion.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 
 #include <utility/boundary_algorithm.hpp>
 #include <utility/params.hpp>
@@ -176,6 +178,11 @@ namespace FlashAttention::V2 {
         cp_async_wait<Stage - 2>();
         __syncthreads();
 
+        namespace cg = cooperative_groups;
+        auto block = cg::this_thread_block();
+        auto warp  = cg::tiled_partition<32>(block);
+        auto group = cg::labeled_partition(warp, get<0>(tSiS(0)));
+
         int mx_idx = 0; 
         CUTE_UNROLL
         for (int kv_idx = 0; kv_idx < ceil_div(params.seq_len, TileKV); kv_idx++, mx_idx ^= 1) {
@@ -209,18 +216,12 @@ namespace FlashAttention::V2 {
             CUTE_UNROLL
             for (int i = 0; i < RowsPerThread; i++) {
                 int a = i % size<0, 1>(tSrS), b = i / size<0, 1>(tSrS);
-                acc_type new_max = (kv_idx != 0 ? tMX(i, mx_idx) : numeric_limits<acc_type>::lowest());
-                CUTE_UNROLL
-                for (int k = 0; k < size<2>(tSrS); k++)  {
-                    CUTE_UNROLL
-                    for (int j = 0; j < size<0, 0>(tSrS); j++) {
-                        new_max = max(new_max, tSrS(make_coord(j, a), b, k));
-                    }
-                }
-                CUTE_UNROLL
-                for (int offset = ThreadsPerRow >> 1; offset; offset >>= 1) {
-                    new_max = max(new_max, __shfl_xor_sync(0xffffffff, new_max, offset));
-                }
+                acc_type new_max = cute::reduce(
+                    tSrS(make_coord(_, a), b, _), 
+                    (kv_idx != 0 ? tMX(i, mx_idx) : numeric_limits<acc_type>::lowest()),
+                    cute::max_fn{}
+                );
+                new_max = cg::reduce(group, new_max, cg::greater<acc_type>{});
                 tMX(i, mx_idx ^ 1) = new_max;
 
                 int row = get<0>(tSiS(make_coord(0, a), b, 0)), col = get<1>(tSiS(make_coord(0, a), b, 0));
@@ -235,10 +236,7 @@ namespace FlashAttention::V2 {
                         return exp_ele;
                     }
                 );
-                CUTE_UNROLL
-                for (int offset = ThreadsPerRow >> 1; offset; offset >>= 1) {
-                    delta_den += __shfl_xor_sync(0xffffffff, delta_den, offset);
-                }
+                delta_den = cg::reduce(group, delta_den, cg::plus<acc_type>{});
                 if (kv_idx != 0) {
                     acc_type rescale = expf((tMX(i, mx_idx) - new_max) * params.scale);
                     cute::transform(
