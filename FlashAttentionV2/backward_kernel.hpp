@@ -2,6 +2,8 @@
 #include <cute/algorithm/tensor_algorithms.hpp>
 #include <cute/algorithm/tensor_reduce.hpp>
 #include <cutlass/numeric_conversion.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 
 #include <utility/boundary_algorithm.hpp>
 #include <utility/params.hpp>
@@ -61,7 +63,6 @@ namespace FlashAttention::V2 {
 
         auto tLSE = make_tensor<lse_type>(Shape<Int<RowsPerThread>>{});
         auto tD   = make_tensor<lse_type>(Shape<Int<RowsPerThread>>{});
-        clear(tD);
 
         Layout GmemLayout = make_layout(
             make_shape(params.batch_size, params.num_heads, params.seq_len, Int<HeadDim>{}),
@@ -77,10 +78,14 @@ namespace FlashAttention::V2 {
 
         MMA tiled_mma;
         ThrMMA thr_mma = tiled_mma.get_slice(threadIdx.x);
-        auto tDrO = thr_mma.partition_fragment_A(gO);    // (MMA, MMA_TileQ, MMA_HeadDim)
-        auto tDrdO = thr_mma.partition_fragment_A(gdO);  // (MMA, MMA_TileQ, MMA_HeadDim)
-        auto tDiO = thr_mma.partition_A(iO);             // (MMA, MMA_TileQ, MMA_HeadDim)
-
+        auto tDrO = thr_mma.partition_fragment_A(gO);          // (MMA, MMA_TileQ, MMA_HeadDim)
+        auto tDrdO = thr_mma.partition_fragment_A(gdO);        // (MMA, MMA_TileQ, MMA_HeadDim)
+        auto tDiO = thr_mma.partition_A(iO);                   // (MMA, MMA_TileQ, MMA_HeadDim)
+        auto tDrO_zip = cute::make_zip_tensor(tDrO, tDrdO);    // (MMA, MMA_TileQ, MMA_HeadDim)
+        auto tDrO_mul = cute::make_tensor(
+            make_transform_iter([]__device__(auto&& zip) { auto [O, dO] = zip; return O * dO; }, tDrO_zip.data()),
+            tDrO_zip.layout()
+        );
         G2SCopy g2s_copy_o;
         ThrCopy thr_g2s_copy_o = g2s_copy_o.get_slice(threadIdx.x);
         S2RCopyA s2r_copy_o;
@@ -104,23 +109,16 @@ namespace FlashAttention::V2 {
         __syncthreads();
         copy(s2r_copy_o, thr_s2r_copy_o.partition_S(sdO), thr_s2r_copy_o.retile_D(tDrdO));
 
+        namespace cg = cooperative_groups;
+        auto block = cg::this_thread_block();
+        auto warp  = cg::tiled_partition<32>(block);
+        auto group = cg::labeled_partition(warp, get<0>(tDiO(0)));
+
         CUTE_UNROLL
         for (int i = 0; i < RowsPerThread; i++) {
-            int a = i % size<0, 1>(tDrO), b = i / size<0, 1>(tDrO);
-            CUTE_UNROLL
-            for (int k = 0; k < size<2>(tDrO); k++)  {
-                CUTE_UNROLL
-                for (int j = 0; j < size<0, 0>(tDrO); j++) {
-                    CUTE_UNROLL
-                    for (int l = 0; l < size<0, 2>(tDrO); l++) {
-                        tD(i) += tDrdO(make_coord(j, a, l), b, k) * tDrO(make_coord(j, a, l), b, k);
-                    }
-                }
-            }
-            CUTE_UNROLL
-            for (int offset = ThreadsPerRow >> 1; offset; offset >>= 1) {
-                tD(i) += __shfl_xor_sync(0xffffffff, tD(i), offset);
-            }
+            int a = i % size<0, 1>(tDiO), b = i / size<0, 1>(tDiO);
+            tD(i) = cute::reduce(tDrO_mul(make_coord(_, a, _), b, _), lse_type(0), cute::plus{});
+            tD(i) = cg::reduce(group, tD(i), cg::plus<lse_type>{});
         }
 
         int d_len = ceil_div(params.seq_len, TileQ) * TileQ;
@@ -139,7 +137,7 @@ namespace FlashAttention::V2 {
         if (threadIdx.x % ThreadsPerRow == 0) {
             CUTE_UNROLL
             for (int i = 0; i < RowsPerThread; i++) {
-                int a = i % size<0, 1>(tDrO), b = i / size<0, 1>(tDrO);
+                int a = i % size<0, 1>(tDiO), b = i / size<0, 1>(tDiO);
                 int row = get<0>(tDiO(make_coord(0, a, 0), b, 0));
                 sD(row) = tD(i);
             }
@@ -148,12 +146,12 @@ namespace FlashAttention::V2 {
         CUTE_UNROLL
         for (int i = threadIdx.x; i < TileQ; i += ThreadsPerCTA) {
             gD(i) = sD(i);
-            sLSE(i) = (blockIdx.z * TileQ + i < params.seq_len ? gLSE(i) : 0.0f);
+            sLSE(i) = gLSE(i);
         }
         __syncthreads();
         CUTE_UNROLL
         for (int i = 0; i < RowsPerThread; i++) {
-            int a = i % size<0, 1>(tDrO), b = i / size<0, 1>(tDrO);
+            int a = i % size<0, 1>(tDiO), b = i / size<0, 1>(tDiO);
             int row = get<0>(tDiO(make_coord(0, a, 0), b, 0));
             tLSE(i) = sLSE(row);
         }
@@ -613,7 +611,7 @@ namespace FlashAttention::V2 {
         CUTE_UNROLL
         for (int i = threadIdx.x; i < TileQ && i < d_len; i += ThreadsPerCTA) {
             sD(i) = gD(i, 0);
-            sLSE(i) = (i < params.seq_len ? gLSE(i, 0) : 0.0f);
+            sLSE(i) = gLSE(i, 0);
         }
         cp_async_wait<Stage - 2>();
         __syncthreads();
@@ -623,7 +621,7 @@ namespace FlashAttention::V2 {
             clear(tSrS);
             CUTE_UNROLL
             for (int i = 0; i < RowsPerThread; i++) {
-                int a = i % size<0, 1>(tSrS), b = i / size<0, 1>(tSrS);
+                int a = i % size<0, 1>(tSiS), b = i / size<0, 1>(tSiS);
                 int row = get<0>(tSiS(make_coord(0, a), b, 0));
                 tLSE(i) = sLSE(row);
                 tD(i) = sD(row);

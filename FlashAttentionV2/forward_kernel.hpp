@@ -319,7 +319,7 @@ namespace FlashAttention::V2 {
         }
         __syncthreads();
         for (int i = threadIdx.x; i < TileQ; i += ThreadsPerCTA) {
-            gLSE(i) = sLSE(i); 
+            gLSE(i) = (blockIdx.z * TileQ + i < params.seq_len ? sLSE(i) : 0.0f);
         }
     }
 }
